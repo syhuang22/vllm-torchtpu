@@ -103,6 +103,8 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
     TPU_MOE_EP_HIER_RS: bool = False
+    TPU_MOE_EP_HIER_RS_ICI_DTYPE: str = "bf16"
+    TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE: float | None = None
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -839,6 +841,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernels instead of the group's. Remove once that is the default or the
     # kernels are retired.
     "TPU_MOE_EP_HIER_RS": env_bool("TPU_MOE_EP_HIER_RS"),
+    # The dtype hierrs_tc sends between chips; accumulation stays bf16.
+    "TPU_MOE_EP_HIER_RS_ICI_DTYPE": env_with_choices(
+        "TPU_MOE_EP_HIER_RS_ICI_DTYPE", "bf16", ["bf16", "fp8"]
+    ),
+    # Required with fp8; see docs/reference/env_vars.md.
+    "TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE": lambda: (
+        float(v) if (v := os.getenv("TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE")) else None
+    ),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's

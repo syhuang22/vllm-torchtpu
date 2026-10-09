@@ -25,7 +25,7 @@ from vllm_torchtpu.kernels.deepseek_v4.rope import (
     _cos_sin_lanes,
     _rotate_gptj,
 )
-from vllm_torchtpu.layers.core.quantization import FP8_E4M3_MAX
+from vllm_torchtpu.kernels.fp8_wire import FP8_E4M3_MAX
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 

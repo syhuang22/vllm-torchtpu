@@ -115,6 +115,24 @@ def test_prebuild_is_a_noop_when_disabled(monkeypatch):
     assert hrs.prebuild_hier_reduce_scatter() is False
 
 
+def test_prebuild_rejects_fp8_without_a_static_scale(monkeypatch):
+    monkeypatch.setattr(hrs, "_ARMED", None)
+    monkeypatch.setattr(hrs.envs, "TPU_MOE_EP_HIER_RS", True, raising=False)
+    monkeypatch.setattr(hrs.envs, "TPU_MOE_EP_HIER_RS_ICI_DTYPE", "fp8", raising=False)
+    monkeypatch.setattr(
+        hrs.envs, "TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE", None, raising=False
+    )
+    with pytest.raises(ValueError, match="TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE"):
+        hrs.prebuild_hier_reduce_scatter()
+
+
+def test_stream_with_dynamic_fp8_scale_is_rejected():
+    with pytest.raises(ValueError, match="no dynamic FP8 scale"):
+        hrs.make_reduce_scatter_fn(
+            None, tuple(range(8)), axis_name="x", fp8_comm=True, stream=True
+        )
+
+
 def test_world_reason_rejects_wrong_size(monkeypatch):
     import torch.distributed as dist
     from vllm.distributed import parallel_state
