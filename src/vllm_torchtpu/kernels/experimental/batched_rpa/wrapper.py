@@ -241,7 +241,7 @@ def calculate_block_sizes(
     concurrently; 8 is the experimentally chosen default.
     """
 
-    tpu_info = pltpu.get_tpu_info()
+    tpu_info = configs._get_tpu_info()
     num_lanes = tpu_info.num_lanes
     mxu_column_size = tpu_info.mxu_column_size
 
