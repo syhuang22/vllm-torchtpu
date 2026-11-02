@@ -208,6 +208,39 @@ def build_example_scenario(
 
 
 @dataclass(frozen=True)
+class HbmBreakdown:
+    """Per-TensorCore HBM bytes split into weights, KV cache, and recurrent state."""
+
+    weights: float
+    kv: float
+    state: float
+    total: float
+
+
+@dataclass(frozen=True)
+class FloorTimes:
+    """Decode-step resource times (ms) behind a point's binding unit."""
+
+    hbm_ms: float
+    matmul_ms: float
+    ici_ms: float
+    chain_ms: float
+    hop_latency_ms: float
+    hard_floor_ms: float
+    binding: str
+
+
+@dataclass(frozen=True)
+class SearchStats:
+    """Search funnel: (layout, concurrency) tuples inside the chip budget."""
+
+    enumerated: int
+    hbm_fit: int
+    slo_met: int
+    frontier: int
+
+
+@dataclass(frozen=True)
 class PoolMeshPlan:
     """Homogeneous instance pool for mixed, prefill-only, or decode-only role."""
 
@@ -224,7 +257,10 @@ class PoolMeshPlan:
     mesh_axes: tuple[int, ...]
     hbm_used_gb: float
     hbm_limit_gb: float
-    moe_dispatch: Literal["allreduce", "ag_ep", "a2a_push"]
+    moe_dispatch: Literal["allreduce", "a2a_push", "ag_ep", "fused_rs"] = "allreduce"
+    hbm_weights_gb: float = 0.0
+    hbm_kv_gb: float = 0.0
+    hbm_state_gb: float = 0.0
     max_num_seqs: int | None = None
     max_model_len: int | None = None
 
@@ -246,6 +282,7 @@ class ParetoPoint:
     p_mixed: float
     binding: str
     slo_met: bool
+    decode_floor: FloorTimes | None = None
     kv_cache_capacity_tokens: int | None = None
     effective_prefix_hit_rate: float | None = None
 
@@ -263,6 +300,7 @@ class ServingPlan:
     warnings: tuple[str, ...]
     candidates: tuple[ParetoPoint, ...] = ()
     gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION
+    search: SearchStats | None = None
 
 
 def _count_layer_types(
@@ -494,7 +532,7 @@ def _compute_kv_state_bytes(
     par: Parallel,
     seq_layout: tuple[int, int, bool],
     counts: tuple[int, int, int, int, int, int],
-) -> float:
+) -> tuple[float, float]:
     """Compute active KV cache and linear recurrent state bytes per core."""
     seqs_per_dp, context, physical_kv_layout = seq_layout
     n_gqa, n_swa, n_mla, _, n_gdn, n_kda = counts
@@ -558,17 +596,17 @@ def _compute_kv_state_bytes(
         kd = geom.linear_k_dim or geom.head_dim
         vd = geom.linear_v_dim or geom.head_dim
         st_bytes += float(seqs_per_dp * n_kda * vh * kd * vd) * dt.state / pp
-    return kv_gqa + kv_swa + kv_mla + st_bytes
+    return kv_gqa + kv_swa + kv_mla, st_bytes
 
 
-def hbm_footprint_per_core_bytes(
+def hbm_breakdown_per_core_bytes(
     geom: ModelGeometry,
     dt: Dtypes,
     par: Parallel,
     seqs_per_dp: int,
     *args: int,
     **kwargs: bool,
-) -> float:
+) -> HbmBreakdown:
     """Compute static model weights plus active KV/recurrent state bytes on one core."""
     context = args[0] if args else int(kwargs.get("context", 0))
     physical_kv_layout = bool(kwargs.get("physical_kv_layout", True))
@@ -587,14 +625,48 @@ def hbm_footprint_per_core_bytes(
         (w_attn, n_gqa + n_swa + n_mla),
         (w_ffn, w_dense_ffn),
     )
-    kv_and_state = _compute_kv_state_bytes(
+    kv, state = _compute_kv_state_bytes(
         geom,
         dt,
         par,
         (seqs_per_dp, context, physical_kv_layout),
         counts,
     )
-    return w_attn + w_rec + w_ffn + w_head + w_mtp + kv_and_state
+    weights = w_attn + w_rec + w_ffn + w_head + w_mtp
+    total = w_attn + w_rec + w_ffn + w_head + w_mtp + kv + state
+    return HbmBreakdown(
+        weights=weights,
+        kv=kv,
+        state=state,
+        total=total,
+    )
+
+
+def hbm_footprint_per_core_bytes(
+    geom: ModelGeometry,
+    dt: Dtypes,
+    par: Parallel,
+    seqs_per_dp: int,
+    *args: int,
+    **kwargs: bool,
+) -> float:
+    """Static model weights plus active KV/recurrent state bytes on one TensorCore."""
+    return hbm_breakdown_per_core_bytes(
+        geom, dt, par, seqs_per_dp, *args, **kwargs
+    ).total
+
+
+def _floor_times(sf: StepFloor) -> FloorTimes:
+    """Decode-step resource times (ms) behind a point's binding unit."""
+    return FloorTimes(
+        hbm_ms=sf.hbm_s * 1e3,
+        matmul_ms=sf.mm_s * 1e3,
+        ici_ms=sf.ici_s * 1e3,
+        chain_ms=sf.chain_s * 1e3,
+        hop_latency_ms=sf.lat_s * 1e3,
+        hard_floor_ms=sf.hard_floor_s * 1e3,
+        binding=sf.binding,
+    )
 
 
 def _default_rpa_page_size(ctx_tokens: int) -> int:
@@ -876,7 +948,7 @@ def _pareto_filter(points: Sequence[ParetoPoint]) -> tuple[ParetoPoint, ...]:
     return tuple(kept)
 
 
-@dataclass(frozen=True)
+@dataclass
 class _SolveContext:
     """Internal solver context capturing model, hardware, and scenario constants."""
 
@@ -898,6 +970,8 @@ class _SolveContext:
     n_chunks: int
     page_size: int
     c_max: int
+    enumerated: int = 0
+    hbm_fit: int = 0
 
 
 @dataclass(frozen=True)
@@ -909,6 +983,7 @@ class _PrefillOption:
     ttft_ms: float
     rate_p: float
     hbm_gb: float
+    hbm_bd: HbmBreakdown
 
 
 @dataclass(frozen=True)
@@ -934,13 +1009,14 @@ def _find_prefill_options(
     for topo in topos:
         best_by_class: dict[tuple[int, bool], _PrefillOption] = {}
         for par in _candidate_prefill_parallels(ctx.geom, topo, for_disagg=True):
-            hbm_b = hbm_footprint_per_core_bytes(
+            hbm_bd = hbm_breakdown_per_core_bytes(
                 ctx.geom,
                 ctx.dtypes,
                 par,
                 1,
                 ctx.scenario.isl,
             )
+            hbm_b = hbm_bd.total
             if hbm_b > ctx.hbm_limit_b:
                 continue
             sf_p = step_floor(
@@ -974,6 +1050,7 @@ def _find_prefill_options(
                     ttft_ms=ttft_ms,
                     rate_p=rate_p,
                     hbm_gb=hbm_b / 1e9,
+                    hbm_bd=hbm_bd,
                 )
         prefill_options.extend(best_by_class.values())
     return prefill_options, min_req_ttft_ms
@@ -1026,18 +1103,27 @@ def _evaluate_mixed_point(
     b_res = min(b_local, b_hbm_max, b_smem_max)
     if ctx.scenario.max_num_seqs is not None:
         b_res = min(b_res, ctx.scenario.max_num_seqs)
-    hbm_b = hbm_footprint_per_core_bytes(ctx.geom, ctx.dtypes, par, b_res, ctx.ctx_full)
+    hbm_bd = hbm_breakdown_per_core_bytes(
+        ctx.geom,
+        ctx.dtypes,
+        par,
+        b_res,
+        ctx.ctx_full,
+    )
+    hbm_b = hbm_bd.total
     while b_res > 1 and hbm_b > ctx.hbm_limit_b:
         b_res -= 1
-        hbm_b = hbm_footprint_per_core_bytes(
+        hbm_bd = hbm_breakdown_per_core_bytes(
             ctx.geom,
             ctx.dtypes,
             par,
             b_res,
             ctx.ctx_full,
         )
+        hbm_b = hbm_bd.total
     if hbm_b > ctx.hbm_limit_b:
         return None
+    ctx.hbm_fit += 1
     cap_tok, h_eff = _kv_capacity_and_hit_rate(
         ctx.geom,
         ctx.dtypes,
@@ -1185,6 +1271,9 @@ def _evaluate_mixed_point(
         hbm_used_gb=hbm_b / 1e9,
         hbm_limit_gb=ctx.hbm_limit_gb,
         moe_dispatch=par.moe_dispatch,
+        hbm_weights_gb=hbm_bd.weights / 1e9,
+        hbm_kv_gb=hbm_bd.kv / 1e9,
+        hbm_state_gb=hbm_bd.state / 1e9,
         max_num_seqs=max_seqs_flag,
         max_model_len=ctx.ctx_full,
     )
@@ -1205,6 +1294,7 @@ def _evaluate_mixed_point(
         p_mixed=p_mix,
         binding=binding,
         slo_met=slo_ok,
+        decode_floor=_floor_times(sf_dec),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=h_eff,
     )
@@ -1288,6 +1378,7 @@ def _evaluate_mixed_candidates(
             ) - hbm_footprint_per_core_bytes(ctx.geom, ctx.dtypes, par, 1, 0)
             bounds = (w_base_b, b_kv_phys_core, b_hbm_max, b_smem_max, sf_ttft)
             for c in ctx.scenario.concurrencies:
+                ctx.enumerated += 1
                 pt = _evaluate_mixed_point(ctx, topo, par, c, bounds)
                 if pt is not None:
                     candidates.append(pt)
@@ -1434,24 +1525,27 @@ def _evaluate_disagg_instance_pair(
     b_res = min(b_local, dec.b_hbm_max, dec.b_smem_max)
     if ctx.scenario.max_num_seqs is not None:
         b_res = min(b_res, ctx.scenario.max_num_seqs)
-    hbm_d = hbm_footprint_per_core_bytes(
+    hbm_bd_d = hbm_breakdown_per_core_bytes(
         ctx.geom,
         ctx.dtypes,
         dec.par,
         b_res,
         ctx.ctx_full,
     )
+    hbm_d = hbm_bd_d.total
     while b_res > 1 and hbm_d > ctx.hbm_limit_b:
         b_res -= 1
-        hbm_d = hbm_footprint_per_core_bytes(
+        hbm_bd_d = hbm_breakdown_per_core_bytes(
             ctx.geom,
             ctx.dtypes,
             dec.par,
             b_res,
             ctx.ctx_full,
         )
+        hbm_d = hbm_bd_d.total
     if hbm_d > ctx.hbm_limit_b:
         return None
+    ctx.hbm_fit += 1
     cap_tok, h_eff = _kv_capacity_and_hit_rate(
         ctx.geom,
         ctx.dtypes,
@@ -1555,6 +1649,9 @@ def _evaluate_disagg_instance_pair(
         hbm_used_gb=pref.hbm_gb,
         hbm_limit_gb=ctx.hbm_limit_gb,
         moe_dispatch=pref.par.moe_dispatch,
+        hbm_weights_gb=pref.hbm_bd.weights / 1e9,
+        hbm_kv_gb=pref.hbm_bd.kv / 1e9,
+        hbm_state_gb=pref.hbm_bd.state / 1e9,
         max_model_len=ctx.ctx_full,
     )
     d_pool = PoolMeshPlan(
@@ -1576,6 +1673,9 @@ def _evaluate_disagg_instance_pair(
         hbm_used_gb=hbm_d / 1e9,
         hbm_limit_gb=ctx.hbm_limit_gb,
         moe_dispatch=dec.par.moe_dispatch,
+        hbm_weights_gb=hbm_bd_d.weights / 1e9,
+        hbm_kv_gb=hbm_bd_d.kv / 1e9,
+        hbm_state_gb=hbm_bd_d.state / 1e9,
         max_num_seqs=max_seqs_d,
         max_model_len=ctx.ctx_full,
     )
@@ -1593,6 +1693,7 @@ def _evaluate_disagg_instance_pair(
         p_mixed=0.0,
         binding=sf_d.binding,
         slo_met=slo_ok,
+        decode_floor=_floor_times(sf_d),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=h_eff,
     )
@@ -1642,6 +1743,10 @@ def _search_disagg_instance_ratios(
     points: list[ParetoPoint] = []
     for x_p in range(1, max_xp + 1):
         for y_d in range(1, max_yd + 1):
+            total_chips = x_p * pref.topo.num_chips + y_d * dec.topo.num_chips
+            if ctx.max_chips is not None and total_chips > ctx.max_chips:
+                continue
+            ctx.enumerated += 1
             pt = _evaluate_disagg_instance_pair(ctx, dec, pref, (c, x_p, y_d), cache)
             if pt is not None:
                 points.append(pt)
@@ -1814,4 +1919,10 @@ def solve_serving_plan(
         warnings=tuple(warnings),
         candidates=tuple(pool_for_frontier),
         gpu_memory_utilization=gpu_memory_utilization,
+        search=SearchStats(
+            enumerated=ctx.enumerated,
+            hbm_fit=ctx.hbm_fit,
+            slo_met=len(slo_candidates),
+            frontier=len(frontier),
+        ),
     )
