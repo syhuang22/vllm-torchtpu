@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 MAX_EMBEDDED_CANDIDATES: int = 2000
 _MIN_FRONTIER_POINTS_FOR_POLYLINE: int = 2
+_PREFIX_RANGE_PAIR_LEN: int = 2
 
 
 def _escape(val: object) -> str:
@@ -636,6 +637,7 @@ def render_html(payload: dict[str, Any]) -> str:
     chip = payload.get("chip") or "TPU"
 
     embedded_payload = dict(payload)
+    embedded_payload.pop("sweep_candidates", None)
     embedded_payload["candidates"] = _downsample_embedded_candidates(
         embedded_payload.get("candidates", ()),
     )
@@ -674,6 +676,23 @@ def render_html(payload: dict[str, Any]) -> str:
     scen_isl = scenario.get("isl", 0)
     scen_osl = scenario.get("osl", 0)
     scen_hit = scenario.get("prefix_hit_rate", 0.0)
+    win_range = payload.get("winner_prefix_hit_range")
+    cross_rate = payload.get("prefix_hit_crossover_rate")
+    crossover_stat_html = ""
+    if win_range is not None and len(win_range) == _PREFIX_RANGE_PAIR_LEN:
+        range_txt = f"[{float(win_range[0]):.2f}, {float(win_range[1]):.2f}]"
+        cross_txt = (
+            f"crossover={float(cross_rate):.2f}" if cross_rate is not None else "stable"
+        )
+        crossover_stat_html = (
+            '      <div class="stat-box">'
+            '        <div class="stat-label">Prefix-Hit Regime</div>'
+            '        <div class="stat-value" style="font-size:15px;">'
+            f"{_escape(range_txt)} "
+            '<span style="font-size:12px; font-weight:normal; color:#64748b;">'
+            f"({_escape(cross_txt)})</span></div>"
+            "      </div>"
+        )
 
     html_parts = [
         "<!DOCTYPE html>",
@@ -734,6 +753,7 @@ def render_html(payload: dict[str, Any]) -> str:
         '        <div class="stat-value" style="font-size:16px;">'
         f"{_escape(rec_binding)}</div>",
         "      </div>",
+        f"{crossover_stat_html}",
         "    </div>",
         f"    {launch_cmds_html}",
         "  </section>",

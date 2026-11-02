@@ -23,28 +23,56 @@ from typing import TYPE_CHECKING
 import pytest
 
 import vllm_torchtpu.roofline as rf
-from vllm_torchtpu.roofline import cli
+from vllm_torchtpu.roofline import (
+    CHIPS,
+    TOPOLOGIES,
+    Dtypes,
+    Parallel,
+    PoolMeshPlan,
+    ServingPlan,
+    StepShape,
+    TrafficScenario,
+    build_example_scenario,
+    build_solve_payload,
+    cli,
+    emit_launch_args,
+    max_ep_load_ratio,
+    partition_pp_layers,
+    point_launch_args,
+    solve_serving_plan,
+    solver,
+    spec_cycle_floor,
+    step_floor,
+    sweep_prefix_hit_crossovers,
+)
 from vllm_torchtpu.roofline.geometry import from_hf_config
 from vllm_torchtpu.roofline.solver import (
     _candidate_decode_parallels,
     _candidate_prefill_parallels,
     _compute_w_ffn,
     _count_full_attn_layers,
+    _CrossoverPlanner,
     _default_rpa_page_size,
     _kv_capacity_and_hit_rate,
     _pareto_filter,
+    _peak_prefill_logit_bytes,
+    _scale_ep_moe_floor,
+    _scale_pp_stage_floor,
+    _scaled_ep_serial_s,
     _smem_max_seqs,
     _valid_gdn_degree,
     _valid_head_tp,
     _valid_raiden_gdn_pair,
-)
-
-from vllm_torchtpu.roofline import CHIPS, Dtypes, Parallel
-from vllm_torchtpu.roofline.solver import (
     hbm_breakdown_per_core_bytes,
     hbm_footprint_per_core_bytes,
-    solve_serving_plan,
 )
+
+_EXPECTED_PP_STAGES: int = 2
+_TARGET_TP_8: int = 8
+_MAX_EP_LOAD_BOUND: float = 8.0
+_DELTA_TOL_TOKENS: int = 2
+_HIT_0_90: float = 0.90
+_HIT_0_95: float = 0.95
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -283,7 +311,28 @@ def _check_pp_prefill_ttft(chip: rf.ChipSpec) -> None:
             topology=rf.TOPOLOGIES[p0.prefill_pool.topology],
         )
         bubble_mult = 1.0 + float(p0.prefill_pool.pp - 1) / float(n_chk)
-        assert p0.p90_ttft_ms == pytest.approx(sf_st.serial_floor_s * bubble_mult * 1e3)
+        chk_disagg_inf_dcn = rf.solve_serving_plan(
+            pp_geom,
+            rf.Dtypes(kv=1.0),
+            dc_replace(chip, dcn_bw=math.inf),
+            chk_scen,
+            mode="disagg",
+            max_chips=8,
+        )
+        p0_inf = next(
+            p
+            for p in chk_disagg_inf_dcn.candidates
+            if p.prefill_pool is not None
+            and p.prefill_pool.pp == p0.prefill_pool.pp
+            and p.prefill_pool.pcp == p0.prefill_pool.pcp
+            and p.prefill_pool.topology == p0.prefill_pool.topology
+            and p.decode_pool.topology == p0.decode_pool.topology
+        )
+        if p0.prefill_pool.ep <= 1:
+            assert p0_inf.p90_ttft_ms == pytest.approx(
+                sf_st.serial_floor_s * bubble_mult * 1e3, rel=1e-4
+            )
+        assert p0.p90_ttft_ms > p0_inf.p90_ttft_ms
 
 
 def test_solver_hybrid_moe_mixed_vs_disagg_and_crossover(
@@ -1152,14 +1201,14 @@ def test_hbm_breakdown_per_core_bytes_exact_hand_formula() -> None:
     nemotron_cfg = {
         "model_type": "nemotron_h",
         "hidden_size": 2048,
-        "num_hidden_layers": 6,
+        "num_hidden_layers": 2,
         "num_attention_heads": 16,
         "num_key_value_heads": 4,
         "head_dim": 128,
         "mamba_num_heads": 32,
         "mamba_head_dim": 64,
         "conv_kernel": 4,
-        "hybrid_override_pattern": "M-M*ME",
+        "hybrid_override_pattern": "-E",
         "n_routed_experts": 8,
         "num_experts_per_tok": 2,
         "moe_intermediate_size": 1024,
@@ -1180,3 +1229,554 @@ def test_hbm_breakdown_per_core_bytes_exact_hand_formula() -> None:
     )
     assert w_dense_ffn == expected_dense_b
     assert w_ffn == expected_dense_b + expected_moe_b
+
+
+def test_pp_stage_dp_interleaved_moe_layer_weights() -> None:
+    """Verify PP stage breakdown isolates MoE weights to stages with MoE layers."""
+    nemotron_cfg = {
+        "model_type": "nemotron_h",
+        "hidden_size": 2048,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "mamba_num_heads": 32,
+        "mamba_head_dim": 64,
+        "conv_kernel": 4,
+        "hybrid_override_pattern": "M-M*ME",
+        "n_routed_experts": 64,
+        "num_experts_per_tok": 4,
+        "moe_intermediate_size": 4096,
+        "intermediate_size": 2048,
+        "vocab_size": 32000,
+    }
+    geom = from_hf_config(nemotron_cfg)
+    dt = Dtypes()
+    par = Parallel(tp=1, pp=2, moe="ep")
+    part, _bd, _, ok = solver.pp_stage_breakdowns(geom, dt, par, (0, 1))
+    assert ok
+    assert part == (5, 1)
+
+    g_mamba = dc_replace(
+        geom, num_layers=1, layer_types=("linear_attention",), ffn_kinds=("none",)
+    )
+    bd_mamba = hbm_breakdown_per_core_bytes(
+        g_mamba, dt, Parallel(tp=1, pp=1, moe="ep"), 1, 0, physical_kv_layout=False
+    )
+    g_dense = dc_replace(geom, num_layers=1, layer_types=(), ffn_kinds=("dense",))
+    bd_dense = hbm_breakdown_per_core_bytes(
+        g_dense, dt, Parallel(tp=1, pp=1, moe="ep"), 1, 0, physical_kv_layout=False
+    )
+    g_moe = dc_replace(geom, num_layers=1, layer_types=(), ffn_kinds=("moe",))
+    bd_moe = hbm_breakdown_per_core_bytes(
+        g_moe, dt, Parallel(tp=1, pp=1, moe="ep"), 1, 0, physical_kv_layout=False
+    )
+    assert bd_mamba.weights < bd_moe.weights
+    assert bd_dense.weights < bd_moe.weights
+
+
+def test_fast_pass_memo_matches_step_and_spec_cycle_floors() -> None:
+    """Verify solver sweep memoization matches step and spec cycle floors."""
+    assert "_FastPassEvaluator" not in solver.__dict__
+    assert "_coll_spec" not in solver.__dict__
+    assert "_fast_ep_busiest" not in solver.__dict__
+    assert "_make_draft_geom" not in solver.__dict__
+
+    chip = CHIPS["tpu7x"]
+    geom = from_hf_config(QWEN35_CFG)
+    dt = Dtypes(kv=1.0, state=2.0)
+    scen = TrafficScenario(
+        name="memo-test",
+        isl=2048,
+        osl=256,
+        concurrencies=(16,),
+        prefix_hit_rate=0.5,
+        accept_len=2.0,
+        think_time_s=0.0,
+        kv_working_set_turns=1.0,
+        spec_tokens=2,
+    )
+    planner = _CrossoverPlanner(geom, dt, chip, scen)
+    pool = PoolMeshPlan(
+        role="mixed",
+        instances=1,
+        tp=2,
+        dp=1,
+        pp=2,
+        pcp=2,
+        ep=2,
+        kv_split=1,
+        chips_per_instance=8,
+        topology="2x2x2",
+        mesh_axes=(2, 2, 2),
+        hbm_used_gb=10.0,
+        hbm_limit_gb=94.76,
+        pp_layer_partition=(5, 3),
+    )
+    pid = planner.get_pool_id(pool)
+
+    pre_sf = planner.compute_pre_sf(pid, pool, 0.5)
+    topo, par, pp_part = planner.pool_plans[pid]
+    eff_pre = max(1, math.ceil(scen.isl * 0.5 / max(1, pool.pcp)))
+    shape_pre = StepShape(
+        batch=0,
+        rows_per_seq=0,
+        context=0,
+        state_writes=0,
+        prefill_tokens=scen.isl,
+        prefix_hit_rate=0.5,
+    )
+    sf_pre_direct = step_floor(geom, chip, par, shape_pre, dtypes=dt, topology=topo)
+    if par.ep > 1:
+        sf_pre_direct = _scale_ep_moe_floor(sf_pre_direct, chip, geom, par, eff_pre)
+    if par.pp > 1:
+        sf_pre_direct = _scale_pp_stage_floor(sf_pre_direct, pp_part, chip, par, topo)
+    assert pre_sf == pytest.approx(sf_pre_direct.serial_floor_s)
+
+    dec_sf, draft_s = planner.get_dec_sf(pid, 4)
+    sf_dec_direct = spec_cycle_floor(
+        geom, chip, par, 4, planner.ctx_mid, planner.spec_k, dt, topology=topo
+    )
+    sf_ver_direct = step_floor(
+        geom,
+        chip,
+        par,
+        StepShape(
+            batch=4,
+            rows_per_seq=planner.spec_k + 1,
+            context=planner.ctx_mid,
+            state_writes=1,
+        ),
+        dtypes=dt,
+        topology=topo,
+    )
+    if par.pp > 1:
+        sf_dec_direct = _scale_pp_stage_floor(sf_dec_direct, pp_part, chip, par, topo)
+        sf_ver_direct = _scale_pp_stage_floor(sf_ver_direct, pp_part, chip, par, topo)
+    if par.ep > 1:
+        tot_tok = 4 * (planner.spec_k + 1)
+        sf_dec_direct = _scale_ep_moe_floor(sf_dec_direct, chip, geom, par, tot_tok)
+        sf_ver_direct = _scale_ep_moe_floor(sf_ver_direct, chip, geom, par, tot_tok)
+    exp_draft = max(0.0, sf_dec_direct.serial_floor_s - sf_ver_direct.serial_floor_s)
+    assert dec_sf == pytest.approx(sf_dec_direct.serial_floor_s)
+    assert draft_s == pytest.approx(exp_draft)
+
+    mix_sf = planner.compute_mix_sf(pid, 4, 512)
+    shape_mix = StepShape(
+        batch=4,
+        rows_per_seq=planner.spec_k + 1,
+        context=planner.ctx_mid,
+        state_writes=1,
+        prefill_tokens=512,
+        prefix_hit_rate=0.0,
+    )
+    sf_mix_direct = step_floor(geom, chip, par, shape_mix, dtypes=dt, topology=topo)
+    if par.pp > 1:
+        sf_mix_direct = _scale_pp_stage_floor(sf_mix_direct, pp_part, chip, par, topo)
+    exp_mix = _scaled_ep_serial_s(
+        sf_mix_direct, chip, geom, par, 4 * (planner.spec_k + 1) + 512
+    )
+    assert mix_sf == pytest.approx(exp_mix)
+
+
+def test_asymmetric_pp_partition_emits_vllm_pp_layer_partition() -> None:
+    """Disagg full-attention stage constraint forces uneven split on 8 layers."""
+    asym_hybrid_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 8,
+        "layer_types": ["linear_attention"] * 6 + ["full_attention"] * 2,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "num_experts": 64,
+        "num_experts_per_tok": 4,
+        "moe_intermediate_size": 2048,
+        "intermediate_size": 1024,
+        "first_k_dense_replace": 2,
+        "vocab_size": 200000,
+        "mtp_num_hidden_layers": 2,
+    }
+    geom = from_hf_config(asym_hybrid_cfg)
+    dt = Dtypes(kv=1.0)
+    par_pp2 = Parallel(tp=1, pp=2, pcp=2, moe="ep", ep=2)
+    part = partition_pp_layers(
+        geom,
+        dt,
+        par_pp2,
+        (4096, 1),
+        disagg=True,
+    )
+    assert part == (7, 1)
+    assert "full_attention" in geom.layer_types[: part[0]]
+    assert "full_attention" in geom.layer_types[part[0] :]
+
+    chip_inf_dcn = dc_replace(CHIPS["tpu7x"], dcn_bw=math.inf)
+    scen_pp = TrafficScenario(
+        name="uneven-pp-disagg",
+        isl=4096,
+        osl=128,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(4,),
+        kv_working_set_turns=1.0,
+        prefill_chunk=4096,
+    )
+    disagg_plan = solve_serving_plan(
+        geom, dt, chip_inf_dcn, scen_pp, mode="disagg", max_chips=4
+    )
+    pt_pp2 = next(
+        p
+        for p in disagg_plan.candidates
+        if p.prefill_pool is not None
+        and p.prefill_pool.pp == _EXPECTED_PP_STAGES
+        and p.prefill_pool.pcp == _EXPECTED_PP_STAGES
+    )
+    assert pt_pp2.prefill_pool is not None
+    assert pt_pp2.prefill_pool.pp_layer_partition == (7, 1)
+    sf_even = step_floor(
+        geom,
+        chip_inf_dcn,
+        dc_replace(par_pp2, ranks_per_chip=2),
+        StepShape(
+            batch=0,
+            rows_per_seq=0,
+            context=0,
+            state_writes=0,
+            prefill_tokens=4096,
+            prefix_hit_rate=0.0,
+        ),
+        dt,
+        topology=TOPOLOGIES["1x2x1"],
+    )
+    assert pt_pp2.p90_ttft_ms > sf_even.serial_floor_s * 1.5 * 1e3
+    launch = point_launch_args(pt_pp2, model="org/synth-hybrid")
+    assert (
+        "VLLM_PP_LAYER_PARTITION=7,1 vllm serve org/synth-hybrid"
+        in launch["commands"][0]
+    )
+
+    odd_geom = dc_replace(
+        geom,
+        num_layers=13,
+        layer_types=("full_attention",) * 13,
+    )
+    odd_plan = solve_serving_plan(
+        odd_geom, dt, chip_inf_dcn, scen_pp, mode="disagg", max_chips=4
+    )
+    pt_odd = next(
+        p
+        for p in odd_plan.candidates
+        if p.prefill_pool is not None and p.prefill_pool.pp == _EXPECTED_PP_STAGES
+    )
+    assert pt_odd.prefill_pool is not None
+    assert pt_odd.prefill_pool.pp_layer_partition == (7, 6)
+    odd_launch = point_launch_args(pt_odd, model="org/synth-odd")
+    assert "VLLM_PP_LAYER_PARTITION=7,6" in odd_launch["commands"][0]
+
+    even_geom = dc_replace(geom, num_layers=12, layer_types=("full_attention",) * 12)
+    even_plan = solve_serving_plan(
+        even_geom, dt, chip_inf_dcn, scen_pp, mode="disagg", max_chips=4
+    )
+    pt_even = next(
+        p
+        for p in even_plan.candidates
+        if p.prefill_pool is not None and p.prefill_pool.pp == _EXPECTED_PP_STAGES
+    )
+    assert pt_even.prefill_pool is not None
+    assert pt_even.prefill_pool.pp_layer_partition is None
+    assert (
+        "VLLM_PP_LAYER_PARTITION"
+        not in point_launch_args(pt_even, model="org/synth-even")["commands"][0]
+    )
+
+    assert max_ep_load_ratio(0, 8) == 1.0
+    assert max_ep_load_ratio(64, 1) == 1.0
+    r_small = max_ep_load_ratio(16, 8)
+    r_large = max_ep_load_ratio(4096, 8)
+    assert 1.0 < r_large < r_small <= _MAX_EP_LOAD_BOUND
+
+
+def test_prefill_logit_hbm_bound_and_disagg_dcn_transfer_floor() -> None:
+    """Verify logit buffer memory bound on prefill and DCN transfer floor."""
+    cfg = {
+        "hidden_size": 2048,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "intermediate_size": 4096,
+        "vocab_size": 256000,
+    }
+    geom = from_hf_config(cfg)
+    dt = Dtypes()
+    par_tp1 = Parallel(tp=1, pp=1)
+    bd_base = hbm_breakdown_per_core_bytes(geom, dt, par_tp1, 0, 0)
+    w_tp1 = bd_base.weights
+    buf_tp1 = _peak_prefill_logit_bytes(geom, dt, par_tp1, 16384)
+    expected_buf_tp1 = 1.0 * (256000.0 / 1.0) * 2.0 + (16384.0 * 2048.0 * 1.0)
+    assert buf_tp1 == expected_buf_tp1
+    tight_hbm = int(w_tp1 + buf_tp1 - 100_000_000)
+    tight_chip = dc_replace(CHIPS["tpu7x"], hbm_bytes=tight_hbm)
+    scen_big_chunk = TrafficScenario(
+        name="logit-oom-check",
+        isl=16384,
+        osl=128,
+        prefix_hit_rate=0.0,
+        accept_len=4.0,
+        think_time_s=0.0,
+        concurrencies=(1,),
+        kv_working_set_turns=1.0,
+        prefill_chunk=16384,
+    )
+    plan_tight = solve_serving_plan(
+        geom,
+        dt,
+        tight_chip,
+        scen_big_chunk,
+        mode="mixed",
+        max_chips=4,
+        gpu_memory_utilization=1.0,
+    )
+    assert len(plan_tight.candidates) > 0
+    assert all(p.decode_pool.tp >= _EXPECTED_PP_STAGES for p in plan_tight.candidates)
+
+    roomy_chip = dc_replace(CHIPS["tpu7x"], hbm_bytes=4_000_000_000)
+    plan_roomy = solve_serving_plan(
+        geom,
+        dt,
+        roomy_chip,
+        scen_big_chunk,
+        mode="mixed",
+        max_chips=4,
+        gpu_memory_utilization=1.0,
+    )
+    assert any(p.decode_pool.tp == 1 for p in plan_roomy.candidates)
+
+    chip_fast_dcn = dc_replace(CHIPS["tpu7x"], dcn_bw=50.0e9)
+    chip_slow_dcn = dc_replace(CHIPS["tpu7x"], dcn_bw=1.25e9)
+    disagg_fast = solve_serving_plan(
+        geom, dt, chip_fast_dcn, scen_big_chunk, mode="disagg", max_chips=4
+    )
+    disagg_slow = solve_serving_plan(
+        geom, dt, chip_slow_dcn, scen_big_chunk, mode="disagg", max_chips=4
+    )
+    assert disagg_fast.recommended is not None
+    assert disagg_slow.recommended is not None
+    assert (
+        disagg_slow.recommended.p90_ttft_ms > disagg_fast.recommended.p90_ttft_ms + 5.0
+    )
+
+
+def test_prefix_hit_crossover_sweep_and_pcie_offload() -> None:
+    """Verify crossover sweep over prefix hit rates and host PCIe offloading."""
+    chip = CHIPS["tpu7x"]
+    geom = from_hf_config(QWEN35_CFG)
+    dt = Dtypes(kv=1.0, state=2.0)
+    scen_no_offload = TrafficScenario(
+        name="offload-compare",
+        isl=32768,
+        osl=512,
+        prefix_hit_rate=_HIT_0_90,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(32,),
+        kv_working_set_turns=20.0,
+        kv_offload_gb=0.0,
+    )
+    scen_offload = dc_replace(scen_no_offload, kv_offload_gb=64.0)
+
+    def _cold_sweep(
+        plan_obj: ServingPlan, repeats: int = 3
+    ) -> tuple[tuple[float, float] | None, float | None]:
+        """Run cold crossover sweep repeats."""
+        last_res: tuple[tuple[float, float] | None, float | None] = (None, None)
+        for _ in range(repeats):
+            hbm_breakdown_per_core_bytes.cache_clear()
+            last_res = sweep_prefix_hit_crossovers(geom, dt, chip, plan_obj)
+        return last_res
+
+    plan_off = solve_serving_plan(
+        geom, dt, chip, scen_offload, mode="auto", max_chips=8
+    )
+    assert len(plan_off.candidates) > len(plan_off.frontier)
+    win_range, cross_rate = _cold_sweep(plan_off)
+    assert win_range is not None
+    assert 0.0 <= win_range[0] <= _HIT_0_90 <= win_range[1] <= _HIT_0_95
+    assert plan_off.winner_prefix_hit_range == win_range
+    assert plan_off.prefix_hit_crossover_rate == cross_rate
+    solve_payload = build_solve_payload(plan_off, chip=chip, dtypes=dt)
+    assert "sweep_candidates" not in solve_payload
+
+    plan_h0 = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        dc_replace(scen_offload, prefix_hit_rate=0.0),
+        mode="auto",
+        max_chips=8,
+    )
+    assert plan_h0.recommended is not None
+    assert plan_off.recommended is not None
+    if (
+        plan_h0.recommended.mode,
+        plan_h0.recommended.decode_pool.topology,
+        plan_h0.recommended.decode_pool.tp,
+    ) != (
+        plan_off.recommended.mode,
+        plan_off.recommended.decode_pool.topology,
+        plan_off.recommended.decode_pool.tp,
+    ):
+        assert cross_rate is not None
+        assert win_range[0] > 0.0
+
+    plan_no = solve_serving_plan(
+        geom, dt, chip, scen_no_offload, mode="mixed", max_chips=4
+    )
+    plan_yes = solve_serving_plan(
+        geom, dt, chip, scen_offload, mode="mixed", max_chips=4
+    )
+    pt_no = next(p for p in plan_no.candidates if p.decode_pool.tp == _TARGET_TP_8)
+    pt_yes = next(p for p in plan_yes.candidates if p.decode_pool.tp == _TARGET_TP_8)
+    b_kv_core = hbm_footprint_per_core_bytes(
+        geom, dt, Parallel(tp=_TARGET_TP_8, moe="ep"), 1, 1
+    ) - hbm_footprint_per_core_bytes(
+        geom, dt, Parallel(tp=_TARGET_TP_8, moe="ep"), 1, 0
+    )
+    expected_delta_tok = int((64.0 * float(1 << 30) / float(_TARGET_TP_8)) / b_kv_core)
+    assert pt_yes.kv_cache_capacity_tokens is not None
+    assert pt_no.kv_cache_capacity_tokens is not None
+    assert (
+        abs(
+            (pt_yes.kv_cache_capacity_tokens - pt_no.kv_cache_capacity_tokens)
+            - expected_delta_tok
+        )
+        <= _DELTA_TOL_TOKENS
+    )
+
+    slow_pcie_plan = solve_serving_plan(
+        geom,
+        dt,
+        dc_replace(chip, pcie_bw=4.0e9),
+        scen_offload,
+        mode="mixed",
+        max_chips=4,
+    )
+    pt_slow_pcie = next(
+        p for p in slow_pcie_plan.candidates if p.decode_pool.tp == _TARGET_TP_8
+    )
+    assert pt_slow_pcie.p90_ttft_ms > pt_yes.p90_ttft_ms
+
+    disagg_fast_pcie = solve_serving_plan(
+        geom, dt, chip, scen_offload, mode="disagg", max_chips=8
+    )
+    disagg_slow_pcie = solve_serving_plan(
+        geom,
+        dt,
+        dc_replace(chip, pcie_bw=4.0e9),
+        scen_offload,
+        mode="disagg",
+        max_chips=8,
+    )
+    assert disagg_fast_pcie.recommended is not None
+    assert disagg_slow_pcie.recommended is not None
+    assert (
+        disagg_slow_pcie.recommended.p90_ttft_ms
+        > disagg_fast_pcie.recommended.p90_ttft_ms
+    )
+
+    emitted = emit_launch_args(plan_yes, dtypes=dt, model="org/synth-moe")
+    assert "sweep_candidates" not in emitted["serving_plan"]
+    assert "--kv-offloading-size" in emitted["cli_args"]
+    idx = emitted["cli_args"].index("--kv-offloading-size")
+    assert emitted["cli_args"][idx + 1] == "64"
+
+
+def test_prefix_hit_crossover_sweep_slo_probe_and_examples() -> None:
+    """Verify crossover sweep with latency SLO bounds and standard scenarios."""
+    chip = CHIPS["tpu7x"]
+    geom = from_hf_config(QWEN35_CFG)
+    dt = Dtypes(kv=1.0, state=2.0)
+
+    def _cold_sweep(
+        plan_obj: ServingPlan, repeats: int = 3
+    ) -> tuple[tuple[float, float] | None, float | None]:
+        """Run cold crossover sweep repeats."""
+        last_res: tuple[tuple[float, float] | None, float | None] = (None, None)
+        for _ in range(repeats):
+            hbm_breakdown_per_core_bytes.cache_clear()
+            last_res = sweep_prefix_hit_crossovers(geom, dt, chip, plan_obj)
+        return last_res
+
+    scen_probe = TrafficScenario(
+        name="slo-crossover-probe",
+        isl=8192,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(8, 32),
+        kv_working_set_turns=1.0,
+    )
+    probe_h0 = solve_serving_plan(geom, dt, chip, scen_probe, mode="mixed", max_chips=4)
+    probe_h95 = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        dc_replace(scen_probe, prefix_hit_rate=_HIT_0_95),
+        mode="mixed",
+        max_chips=4,
+    )
+    assert probe_h0.recommended is not None
+    assert probe_h95.recommended is not None
+    mid_ttft_slo = 0.5 * (
+        probe_h0.recommended.p90_ttft_ms + probe_h95.recommended.p90_ttft_ms
+    )
+    scen_slo = dc_replace(scen_probe, ttft_slo_ms=mid_ttft_slo)
+    plan_slo_h0 = solve_serving_plan(
+        geom, dt, chip, scen_slo, mode="mixed", max_chips=4
+    )
+    plan_slo_h95 = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        dc_replace(scen_slo, prefix_hit_rate=_HIT_0_95),
+        mode="mixed",
+        max_chips=4,
+    )
+    assert plan_slo_h0.recommended is not None
+    assert plan_slo_h95.recommended is not None
+    if (
+        plan_slo_h0.recommended.decode_pool.tp,
+        plan_slo_h0.recommended.concurrency,
+    ) != (
+        plan_slo_h95.recommended.decode_pool.tp,
+        plan_slo_h95.recommended.concurrency,
+    ):
+        assert plan_slo_h0.prefix_hit_crossover_rate is not None
+        assert plan_slo_h0.winner_prefix_hit_range is not None
+        assert plan_slo_h0.winner_prefix_hit_range[1] < _HIT_0_95
+
+    for ex_name, n_chips in (
+        ("coding-agent", 8),
+        ("chat-8k1k", 16),
+        ("reasoning-1k8k", 16),
+    ):
+        ex_scen = build_example_scenario(ex_name)
+        ex_plan = solve_serving_plan(
+            geom, dt, chip, ex_scen, mode="auto", max_chips=n_chips
+        )
+        ex_range, _ex_cross = _cold_sweep(ex_plan)
+        assert ex_range is not None
+        if ex_name == "chat-8k1k":
+            ex_uncached = dc_replace(ex_plan, sweep_candidates=())
+            fb_range, fb_cross = _cold_sweep(ex_uncached, repeats=1)
+            assert (fb_range, fb_cross) == (
+                ex_plan.winner_prefix_hit_range,
+                ex_plan.prefix_hit_crossover_rate,
+            )

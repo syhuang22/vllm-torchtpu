@@ -236,7 +236,9 @@ def step_floor(
         elif isinstance(a, SliceTopology):
             topology = a
     if "collective_latency_s" in kwargs and kwargs["collective_latency_s"] is not None:
-        collective_latency_s = float(kwargs["collective_latency_s"])
+        raw_cl = kwargs["collective_latency_s"]
+        if isinstance(raw_cl, (int, float, str)):
+            collective_latency_s = float(raw_cl)
     raw_par = kwargs.get("override_par") or kwargs.get("par") or par
     actual_par: Parallel = raw_par if isinstance(raw_par, Parallel) else par
 
@@ -259,10 +261,15 @@ def spec_cycle_floor(
     **kwargs: float | Dtypes | SliceTopology | None,
 ) -> StepFloor:
     """Compute the floor for one speculative cycle (verify + k draft passes)."""
-    context: int = int(kwargs.get("context", 0) or 0)
-    k: int = int(kwargs.get("k", kwargs.get("spec_window", 0)) or 0)
+    raw_ctx = kwargs.get("context", 0)
+    context: int = int(raw_ctx) if isinstance(raw_ctx, (int, float, str)) else 0
+    raw_k = kwargs.get("k", kwargs.get("spec_window", 0))
+    k: int = int(raw_k) if isinstance(raw_k, (int, float, str)) else 0
     dt: Dtypes = kwargs["dt"] if isinstance(kwargs.get("dt"), Dtypes) else Dtypes()
-    collective_latency_s: float = float(kwargs.get("collective_latency_s", 0.0) or 0.0)
+    raw_cls = kwargs.get("collective_latency_s", 0.0)
+    collective_latency_s: float = (
+        float(raw_cls) if isinstance(raw_cls, (int, float, str)) else 0.0
+    )
     topology: SliceTopology | None = (
         kwargs["topology"]
         if isinstance(kwargs.get("topology"), SliceTopology)
@@ -376,9 +383,7 @@ def spec_cycle_floor(
             fp8_flops=m.fp8_flops * k,
             bf16_flops=m.bf16_flops * k,
             collectives=m.collectives * k,
-            hbm_bytes_min=(
-                None if m.hbm_bytes_min is None else m.hbm_bytes_min * k
-            ),
+            hbm_bytes_min=(None if m.hbm_bytes_min is None else m.hbm_bytes_min * k),
             unique_collectives=(
                 None
                 if m.unique_collectives is None

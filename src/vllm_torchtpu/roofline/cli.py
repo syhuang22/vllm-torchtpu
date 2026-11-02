@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import shlex
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -33,6 +35,8 @@ from .solver import (
     EXAMPLE_CONCURRENCIES,
     EXAMPLE_SCENARIOS,
     EXAMPLE_SLO_TIERS,
+    ParetoPoint,
+    PoolMeshPlan,
     TrafficScenario,
     build_example_scenario,
     solve_serving_plan,
@@ -50,11 +54,142 @@ _KV_BYTES: dict[str, float] = {"bf16": 2.0, "fp8": 1.0}
 _STATE_BYTES: dict[str, float] = {"fp32": 4.0, "bf16": 2.0}
 
 
-def _add_model_source(p: argparse.ArgumentParser) -> None:
+def _add_model_source(p: argparse.ArgumentParser, *, required: bool = True) -> None:
     """Add mutually exclusive --config or --model flags to parser."""
-    grp = p.add_mutually_exclusive_group(required=True)
+    grp = p.add_mutually_exclusive_group(required=required)
     grp.add_argument("--config", help="Path to HF config.json")
     grp.add_argument("--model", help="HF model ID, directory, or config.json")
+
+
+def _normalize_tokens(raw_cmd: str) -> list[str]:
+    """Split command string into tokens, expanding --flag=val into separate tokens."""
+    out: list[str] = []
+    for tok in shlex.split(raw_cmd):
+        if tok.startswith("--") and "=" in tok:
+            k, v = tok.split("=", 1)
+            out.extend([k, v])
+        else:
+            out.append(tok)
+    return out
+
+
+_SERVE_STR_FLAGS: dict[str, str] = {
+    "--model": "model",
+    "--quantization": "quantization",
+    "-q": "quantization",
+    "--kv-cache-dtype": "kv_cache_dtype",
+}
+_SERVE_INT_FLAGS: dict[str, str] = {
+    "--tensor-parallel-size": "tp",
+    "-tp": "tp",
+    "--data-parallel-size": "dp",
+    "-dp": "dp",
+    "--pipeline-parallel-size": "pp",
+    "-pp": "pp",
+    "--prefill-context-parallel-size": "pcp",
+    "--max-num-seqs": "max_num_seqs",
+    "--max-model-len": "max_model_len",
+    "--max-num-batched-tokens": "max_num_batched_tokens",
+}
+_SERVE_FLOAT_FLAGS: dict[str, str] = {
+    "--gpu-memory-utilization": "gpu_memory_utilization",
+    "--kv-offloading-size": "kv_offload_gb",
+}
+
+
+def _parse_spec_config_into(raw_spec: str, parsed: dict[str, object]) -> None:
+    """Parse speculative config JSON if present."""
+    parsed["speculative_config"] = raw_spec
+    if not raw_spec.strip().startswith("{"):
+        return
+    try:
+        spec_obj = json.loads(raw_spec)
+    except json.JSONDecodeError:
+        return
+    if isinstance(spec_obj, dict):
+        if "num_speculative_tokens" in spec_obj:
+            parsed["spec_tokens"] = int(spec_obj["num_speculative_tokens"])
+        if "method" in spec_obj:
+            parsed["spec_method"] = str(spec_obj["method"]).lower()
+
+
+def _parse_serve_cmd(raw_cmd: str) -> dict[str, object]:
+    """Parse vLLM serve command into dictionary of options."""
+    toks = _normalize_tokens(raw_cmd)
+    parsed: dict[str, object] = {}
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t == "serve" and i + 1 < len(toks) and not toks[i + 1].startswith("-"):
+            parsed.setdefault("model", toks[i + 1])
+            i += 2
+            continue
+        if t in _SERVE_STR_FLAGS and i + 1 < len(toks):
+            parsed[_SERVE_STR_FLAGS[t]] = toks[i + 1]
+            i += 2
+            continue
+        if t in _SERVE_INT_FLAGS and i + 1 < len(toks):
+            parsed[_SERVE_INT_FLAGS[t]] = int(toks[i + 1])
+            i += 2
+            continue
+        if t in _SERVE_FLOAT_FLAGS and i + 1 < len(toks):
+            parsed[_SERVE_FLOAT_FLAGS[t]] = float(toks[i + 1])
+            i += 2
+            continue
+        if t == "--speculative-config" and i + 1 < len(toks):
+            _parse_spec_config_into(toks[i + 1], parsed)
+            i += 2
+            continue
+        i += 1
+    return parsed
+
+
+parse_serve_cmd = _parse_serve_cmd
+
+
+_BENCH_STR_FLAGS: dict[str, str] = {
+    "--model": "model",
+}
+_BENCH_INT_FLAGS: dict[str, str] = {
+    "--random-input-len": "random_input_len",
+    "--sonnet-input-len": "sonnet_input_len",
+    "--input-len": "generic_input_len",
+    "--random-output-len": "osl",
+    "--output-len": "osl",
+    "--sonnet-output-len": "osl",
+    "--random-prefix-len": "shared_prefix_len",
+    "--prefix-len": "shared_prefix_len",
+    "--sonnet-prefix-len": "shared_prefix_len",
+    "--max-model-len": "max_model_len",
+    "--max-num-batched-tokens": "max_num_batched_tokens",
+}
+
+
+def _parse_bench_cmd(raw_cmd: str) -> dict[str, object]:
+    """Parse vLLM bench command into dictionary of options."""
+    toks = _normalize_tokens(raw_cmd)
+    parsed: dict[str, object] = {}
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in _BENCH_STR_FLAGS and i + 1 < len(toks):
+            parsed[_BENCH_STR_FLAGS[t]] = toks[i + 1]
+            i += 2
+            continue
+        if t == "--dataset-name" and i + 1 < len(toks):
+            parsed["dataset_name"] = toks[i + 1].strip().lower()
+            i += 2
+            continue
+        if t in _BENCH_INT_FLAGS and i + 1 < len(toks):
+            parsed[_BENCH_INT_FLAGS[t]] = int(toks[i + 1])
+            i += 2
+            continue
+        if t == "--max-concurrency" and i + 1 < len(toks):
+            parsed["concurrency"] = toks[i + 1]
+            i += 2
+            continue
+        i += 1
+    return parsed
 
 
 def _add_common_args(p: argparse.ArgumentParser, *, tp_required: bool = True) -> None:
@@ -94,7 +229,7 @@ def _add_common_args(p: argparse.ArgumentParser, *, tp_required: bool = True) ->
 
 def _add_scenario_args(p: argparse.ArgumentParser) -> None:
     """Add traffic scenario, SLO, and instance constraint flags."""
-    _add_model_source(p)
+    _add_model_source(p, required=False)
     p.add_argument("--chip", default="tpu7x", choices=sorted(CHIPS))
     p.add_argument(
         "--example-scenario", default=None, choices=sorted(EXAMPLE_SCENARIOS)
@@ -111,12 +246,18 @@ def _add_scenario_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--osl", type=int, default=None)
     p.add_argument("--concurrency", default=None)
     p.add_argument("--prefix-hit-rate", type=float, default=None)
+    p.add_argument("--shared-prefix-len", type=int, default=None)
+    p.add_argument("--random-prefix-len", type=int, default=None)
+    p.add_argument("--dcn-gbps", type=float, default=None)
+    p.add_argument("--kv-offload-gb", type=float, default=None)
+    p.add_argument("--from-serve-cmd", type=str, default=None)
+    p.add_argument("--from-bench-cmd", type=str, default=None)
     p.add_argument("--accept-len", type=float, default=None)
     p.add_argument("--think-time-s", type=float, default=None)
     p.add_argument(
         "--gpu-memory-utilization",
         type=float,
-        default=DEFAULT_GPU_MEMORY_UTILIZATION,
+        default=None,
     )
     p.add_argument("--json", action="store_true")
 
@@ -155,37 +296,194 @@ def main(argv: list[str] | None = None) -> int:
     p_exp.add_argument("--spec-window", type=int, default=0)
 
     args = parser.parse_args(raw_argv)
-    src = args.model if args.model is not None else args.config
+    serve_parsed = (
+        _parse_serve_cmd(args.from_serve_cmd)
+        if args.cmd in ("solve", "emit", "ceiling") and args.from_serve_cmd
+        else {}
+    )
+    bench_parsed = (
+        _parse_bench_cmd(args.from_bench_cmd)
+        if args.cmd in ("solve", "emit", "ceiling") and args.from_bench_cmd
+        else {}
+    )
+    src = (
+        args.model
+        if args.model is not None
+        else (
+            args.config
+            if args.config is not None
+            else str(serve_parsed.get("model") or bench_parsed.get("model") or "")
+        )
+    )
+    if not src:
+        parser.error(
+            "One of --config, --model, or --from-serve-cmd with a model is required."
+        )
     cfg = load_hf_config(src)
+    q_sub = cfg.get("text_config")
+    has_qcfg = bool(
+        cfg.get("quantization_config")
+        or (type(q_sub) is dict and q_sub.get("quantization_config"))
+    )
+    if "quantization" in serve_parsed and not has_qcfg:
+        q_val = str(serve_parsed["quantization"]).lower()
+        if q_val and q_val != "none":
+            cfg = {**cfg, "quantization_config": {"quant_method": q_val}}
     geom = from_hf_config(cfg)
     chip = CHIPS[args.chip]
 
     if args.cmd in ("solve", "emit", "ceiling"):
+        if args.dcn_gbps is not None:
+            chip = replace(chip, dcn_bw=args.dcn_gbps * 1e9 / 8.0)
+        if (
+            args.shared_prefix_len is not None
+            and args.random_prefix_len is not None
+            and args.shared_prefix_len != args.random_prefix_len
+        ):
+            parser.error(
+                "--shared-prefix-len and --random-prefix-len both specify "
+                "cached prefix tokens and cannot differ."
+            )
+        eff_conc_str = args.concurrency or (
+            str(bench_parsed["concurrency"]) if "concurrency" in bench_parsed else None
+        )
         concs = (
-            tuple(int(x) for x in args.concurrency.split(",") if x.strip())
-            if args.concurrency
+            tuple(int(x) for x in eff_conc_str.split(",") if x.strip())
+            if eff_conc_str
             else None
         )
+        eff_osl = (
+            args.osl
+            if args.osl is not None
+            else (int(str(bench_parsed["osl"])) if "osl" in bench_parsed else None)
+        )
+        cli_prefix_len = (
+            args.shared_prefix_len
+            if args.shared_prefix_len is not None
+            else args.random_prefix_len
+        )
+        shared_p = (
+            cli_prefix_len
+            if cli_prefix_len is not None
+            else (
+                int(str(bench_parsed["shared_prefix_len"]))
+                if "shared_prefix_len" in bench_parsed
+                else None
+            )
+        )
+        eff_isl = args.isl
+        if eff_isl is None:
+            ds_name = str(bench_parsed.get("dataset_name", "random"))
+            if "sonnet_input_len" in bench_parsed:
+                eff_isl = int(str(bench_parsed["sonnet_input_len"]))
+            elif "random_input_len" in bench_parsed:
+                eff_isl = int(str(bench_parsed["random_input_len"])) + (
+                    shared_p if shared_p is not None else 0
+                )
+            elif "generic_input_len" in bench_parsed:
+                base_in = int(str(bench_parsed["generic_input_len"]))
+                eff_isl = (
+                    base_in
+                    if ds_name == "sonnet"
+                    else base_in + (shared_p if shared_p is not None else 0)
+                )
+        eff_hit = args.prefix_hit_rate
+        if eff_hit is None:
+            if shared_p is not None and eff_isl is not None and eff_isl > 0:
+                eff_hit = min(1.0, max(0.0, float(shared_p) / float(eff_isl)))
+            elif bench_parsed:
+                eff_hit = 0.0
+        from_cmd_mode = bool(serve_parsed or bench_parsed or cli_prefix_len is not None)
+        eff_spec = int(str(serve_parsed.get("spec_tokens", 0)))
+        eff_chunk = int(
+            str(
+                serve_parsed.get("max_num_batched_tokens")
+                or bench_parsed.get("max_num_batched_tokens")
+                or 0
+            )
+        )
+        cmd_max_model_len = int(
+            str(
+                serve_parsed.get("max_model_len")
+                or bench_parsed.get("max_model_len")
+                or 0
+            )
+        )
+        eff_accept = (
+            args.accept_len
+            if args.accept_len is not None
+            else (
+                (1.0 + 0.8 * eff_spec)
+                if from_cmd_mode and eff_spec > 0
+                else (
+                    max(1.0 + 0.7 * eff_spec, 1.5)
+                    if eff_spec > 0
+                    else (1.0 if from_cmd_mode else None)
+                )
+            )
+        )
+        eff_think = (
+            args.think_time_s
+            if args.think_time_s is not None
+            else (0.0 if from_cmd_mode else None)
+        )
+        eff_offload = (
+            args.kv_offload_gb
+            if args.kv_offload_gb is not None
+            else (
+                float(str(serve_parsed["kv_offload_gb"]))
+                if "kv_offload_gb" in serve_parsed
+                else 0.0
+            )
+        )
+        eff_max_seqs = (
+            int(str(serve_parsed["max_num_seqs"]))
+            if "max_num_seqs" in serve_parsed
+            else None
+        )
+        eff_gmu = (
+            args.gpu_memory_utilization
+            if args.gpu_memory_utilization is not None
+            else (
+                float(str(serve_parsed["gpu_memory_utilization"]))
+                if "gpu_memory_utilization" in serve_parsed
+                else DEFAULT_GPU_MEMORY_UTILIZATION
+            )
+        )
+        if eff_isl is None and from_cmd_mode:
+            eff_isl = 1024
+        if eff_osl is None and from_cmd_mode:
+            eff_osl = 128
+        if eff_hit is None and from_cmd_mode:
+            eff_hit = 0.0
         if args.example_scenario is not None:
             scen = build_example_scenario(
                 args.example_scenario,
-                isl=args.isl,
-                osl=args.osl,
+                isl=eff_isl,
+                osl=eff_osl,
                 concurrencies=concs,
-                prefix_hit_rate=args.prefix_hit_rate,
+                prefix_hit_rate=eff_hit,
                 accept_len=args.accept_len,
                 think_time_s=args.think_time_s,
                 slo_tier=args.example_slo_tier,
                 ttft_slo_ms=args.ttft_slo_ms,
                 tpot_slo_ms=args.tpot_slo_ms,
             )
+            if eff_offload > 0.0:
+                scen = replace(scen, kv_offload_gb=eff_offload)
+            if eff_max_seqs is not None:
+                scen = replace(scen, max_num_seqs=eff_max_seqs)
+            if eff_spec > 0:
+                scen = replace(scen, spec_tokens=eff_spec)
+            if eff_chunk > 0:
+                scen = replace(scen, prefill_chunk=eff_chunk)
         else:
             if (
-                args.isl is None
-                or args.osl is None
-                or args.prefix_hit_rate is None
-                or args.accept_len is None
-                or args.think_time_s is None
+                eff_isl is None
+                or eff_osl is None
+                or eff_hit is None
+                or eff_accept is None
+                or eff_think is None
             ):
                 parser.error(
                     "Either --example-scenario or all of --isl, --osl, "
@@ -194,29 +492,90 @@ def main(argv: list[str] | None = None) -> int:
                 )
             scen = TrafficScenario(
                 name="custom",
-                isl=args.isl,
-                osl=args.osl,
-                prefix_hit_rate=args.prefix_hit_rate,
-                accept_len=args.accept_len,
-                think_time_s=args.think_time_s,
+                isl=eff_isl,
+                osl=eff_osl,
+                prefix_hit_rate=eff_hit,
+                accept_len=eff_accept,
+                think_time_s=eff_think,
                 concurrencies=concs if concs is not None else EXAMPLE_CONCURRENCIES,
                 kv_working_set_turns=1.0,
                 ttft_slo_ms=args.ttft_slo_ms,
                 tpot_slo_ms=args.tpot_slo_ms,
+                kv_offload_gb=eff_offload,
+                max_num_seqs=eff_max_seqs,
+                spec_tokens=eff_spec if eff_spec > 0 else None,
+                prefill_chunk=eff_chunk if eff_chunk > 0 else 2048,
             )
-        if args.max_chips is None and args.max_instances is None:
+        eff_max_chips = args.max_chips
+        if eff_max_chips is None and args.max_instances is None and serve_parsed:
+            s_tp = int(str(serve_parsed.get("tp", 1)))
+            s_dp = int(str(serve_parsed.get("dp", 1)))
+            s_pp = int(str(serve_parsed.get("pp", 1)))
+            s_pcp = int(str(serve_parsed.get("pcp", 1)))
+            eff_max_chips = max(
+                1,
+                math.ceil((s_tp * s_dp * s_pp * s_pcp) / max(1, chip.cores_per_chip)),
+            )
+        if eff_max_chips is None and args.max_instances is None:
             parser.error("Either --max-chips or --max-instances is required.")
         dt_auto = dtypes_from_hf_config(cfg)
+        if "kv_cache_dtype" in serve_parsed:
+            kv_dt = str(serve_parsed["kv_cache_dtype"]).lower()
+            if kv_dt.startswith("fp8"):
+                dt_auto = replace(dt_auto, kv=1.0)
+            elif kv_dt in ("bf16", "bfloat16", "fp16", "float16"):
+                dt_auto = replace(dt_auto, kv=2.0)
         splan = solve_serving_plan(
             geom,
             dt_auto,
             chip,
             scen,
             mode=args.mode,
-            max_chips=args.max_chips,
+            max_chips=eff_max_chips,
             max_instances=args.max_instances,
-            gpu_memory_utilization=args.gpu_memory_utilization,
+            gpu_memory_utilization=eff_gmu,
         )
+        cmd_warnings: list[str] = []
+        if serve_parsed.get("spec_method") and serve_parsed["spec_method"] != "mtp":
+            cmd_warnings.append(
+                f"Speculative method '{serve_parsed['spec_method']}' is not MTP; "
+                "roofline assumes MTP draft geometry."
+            )
+        if cmd_max_model_len > 0:
+            if cmd_max_model_len < (scen.isl + scen.osl):
+                cmd_warnings.append(
+                    f"--max-model-len {cmd_max_model_len} is smaller than isl + osl "
+                    f"({scen.isl + scen.osl})."
+                )
+
+            def _cap_pool(p: PoolMeshPlan) -> PoolMeshPlan:
+                """Cap pool's max_model_len to CLI override."""
+                return replace(p, max_model_len=cmd_max_model_len)
+
+            def _cap_pt(pt: ParetoPoint) -> ParetoPoint:
+                """Cap Pareto point pool max_model_len to CLI override."""
+                p_pool = (
+                    _cap_pool(pt.prefill_pool) if pt.prefill_pool is not None else None
+                )
+                return replace(
+                    pt,
+                    decode_pool=_cap_pool(pt.decode_pool),
+                    prefill_pool=p_pool,
+                )
+
+            new_rec = (
+                _cap_pt(splan.recommended) if splan.recommended is not None else None
+            )
+            new_frontier = tuple(_cap_pt(pt) for pt in splan.frontier)
+            new_candidates = tuple(_cap_pt(pt) for pt in splan.candidates)
+            splan = replace(
+                splan,
+                recommended=new_rec,
+                frontier=new_frontier,
+                candidates=new_candidates,
+            )
+        if cmd_warnings:
+            splan = replace(splan, warnings=splan.warnings + tuple(cmd_warnings))
         if args.cmd == "ceiling":
             rows_ceil = emit_ceiling_rows(splan)
             if not rows_ceil:
@@ -236,7 +595,9 @@ def main(argv: list[str] | None = None) -> int:
             emitted = emit_launch_args(
                 splan,
                 dtypes=dt_auto,
-                model=args.model,
+                model=args.model
+                if args.model is not None
+                else (src if serve_parsed else None),
             )
             if not emitted["commands"]:
                 for w in emitted["warnings"]:

@@ -205,9 +205,7 @@ def supports(cfg: Mapping[str, Any]) -> None:
         raise UnsupportedArchitectureError(msg)
     has_gdn = _has_gdn_kda_heads(tc)
     if mtype in _UNSUPPORTED_SSM_MODEL_TYPES and not has_gdn:
-        msg = (
-            f"Unsupported state-space model_type {mtype!r} without GDN/KDA head keys"
-        )
+        msg = f"Unsupported state-space model_type {mtype!r} without GDN/KDA head keys"
         raise UnsupportedArchitectureError(msg)
     if ("ssm_cfg" in tc or "state_size" in tc) and not (
         tc.get("num_attention_heads") or has_gdn
@@ -279,8 +277,7 @@ def _resolve_layer_types(
         and len(attn_list) == num_layers
     ):
         return tuple(
-            "full_attention" if int(v) == 1 else "linear_attention"
-            for v in attn_list
+            "full_attention" if int(v) == 1 else "linear_attention" for v in attn_list
         )
     if type(hyb_pat) is str and len(hyb_pat.strip()) == num_layers:
         _hop = {
@@ -341,8 +338,7 @@ def _resolve_ffn_kinds(
     hyb_s = str(tc.get("hybrid_override_pattern") or "").strip()
     if hyb_s and len(hyb_s) == num_layers:
         return tuple(
-            "moe" if ch == "E" else ("dense" if ch == "-" else "none")
-            for ch in hyb_s
+            "moe" if ch == "E" else ("dense" if ch == "-" else "none") for ch in hyb_s
         )
 
     raw_moe_layers = tc.get("moe_layers")
@@ -359,9 +355,7 @@ def _resolve_ffn_kinds(
 
     first_k_dense = int(tc.get("first_k_dense_replace", 0) or 0)
     if num_experts > 0:
-        return tuple(
-            "dense" if i < first_k_dense else "moe" for i in range(num_layers)
-        )
+        return tuple("dense" if i < first_k_dense else "moe" for i in range(num_layers))
 
     return ("dense",) * num_layers
 

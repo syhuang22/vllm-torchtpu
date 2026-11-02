@@ -44,6 +44,8 @@ class ChipSpec:
     ici_link_bw: float = 100.0e9
     ici_hop_latency_s: float = 1.0e-6
     mxu_m_tile: int = 256
+    dcn_bw: float = 25.0e9
+    pcie_bw: float = 64.0e9
 
 
 _FALLBACK_TPU_SPECS: dict[str, tuple[int, float, float, float, int]] = {

@@ -52,11 +52,8 @@ def plan(
     **kwargs: float | Sequence[int] | None,
 ) -> list[ConcurrencyRow]:
     """Compute ConcurrencyRow ceilings across a list of concurrencies."""
-    context: int = (
-        int(args[0])
-        if len(args) > 0 and isinstance(args[0], int)
-        else int(kwargs.get("context", 0) or 0)
-    )
+    raw_ctx = args[0] if len(args) > 0 else kwargs.get("context", 0)
+    context: int = int(raw_ctx) if isinstance(raw_ctx, (int, float, str)) else 0
     raw_conc = (
         args[1]
         if len(args) > 1 and isinstance(args[1], Sequence)
@@ -64,13 +61,20 @@ def plan(
     )
     concurrencies: Sequence[int] = raw_conc if isinstance(raw_conc, Sequence) else ()
 
-    spec_window: int = int(kwargs.get("spec_window", 0) or 0)
+    raw_sw = kwargs.get("spec_window", 0)
+    spec_window: int = int(raw_sw) if isinstance(raw_sw, (int, float, str)) else 0
     raw_al = kwargs.get("acceptance_length")
-    acceptance_length: float | None = float(raw_al) if raw_al is not None else None
+    acceptance_length: float | None = (
+        float(raw_al) if isinstance(raw_al, (int, float, str)) else None
+    )
     raw_cl = kwargs.get("collective_latency_us")
-    collective_latency_us: float | None = float(raw_cl) if raw_cl is not None else None
+    collective_latency_us: float | None = (
+        float(raw_cl) if isinstance(raw_cl, (int, float, str)) else None
+    )
     raw_tcp = kwargs.get("tensor_cores_per_chip", 2)
-    tensor_cores_per_chip: int = int(raw_tcp) if raw_tcp is not None else 2
+    tensor_cores_per_chip: int = (
+        int(raw_tcp) if isinstance(raw_tcp, (int, float, str)) else 2
+    )
 
     chips = par.tp / float(tensor_cores_per_chip)
     if spec_window == 0:

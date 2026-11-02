@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +33,8 @@ def pool_cli_args(
     *,
     kv_dtype: str = "auto",
     gpu_memory_utilization: float | None = None,
+    spec_tokens: int = 0,
+    mtp_layers: int = 0,
 ) -> list[str]:
     """Translate one ``PoolMeshPlan`` into ``vllm serve`` CLI flags."""
     args = [
@@ -54,16 +57,38 @@ def pool_cli_args(
         args.extend(["--max-model-len", str(pool.max_model_len)])
     if pool.max_num_seqs is not None:
         args.extend(["--max-num-seqs", str(pool.max_num_seqs)])
+    if pool.kv_offload_gb > 0.0:
+        args.extend(["--kv-offloading-size", f"{pool.kv_offload_gb:g}"])
     if gpu_memory_utilization is not None:
         args.extend(["--gpu-memory-utilization", f"{gpu_memory_utilization:g}"])
+    if spec_tokens > 0 and pool.role != "prefill" and mtp_layers > 0:
+        args.extend(
+            [
+                "--speculative-config",
+                f'{{"method":"mtp","num_speculative_tokens":{spec_tokens}}}',
+            ]
+        )
     return args
 
 
-def _format_server_cmd(cli_args: list[str], model: str | None) -> str:
+def _format_server_cmd(
+    cli_args: list[str],
+    model: str | None,
+    *,
+    pp_layer_partition: tuple[int, ...] | None = None,
+    moe_dispatch: str = "allreduce",
+) -> str:
     """Format launch CLI arguments as a standalone bash command string."""
-    joined = " ".join(cli_args)
+    joined = shlex.join(cli_args)
     prefix = f"vllm serve {model}" if model else "vllm serve"
-    return f"{prefix} {joined}".strip()
+    cmd = f"{prefix} {joined}".strip()
+    env_parts: list[str] = []
+    if moe_dispatch in ("a2a_push", "fused_rs"):
+        env_parts.append("USE_MOE_FUSED_EP_KERNEL=1")
+    if pp_layer_partition is not None and len(set(pp_layer_partition)) > 1:
+        part_str = ",".join(str(x) for x in pp_layer_partition)
+        env_parts.append(f"VLLM_PP_LAYER_PARTITION={part_str}")
+    return f"{' '.join(env_parts)} {cmd}" if env_parts else cmd
 
 
 def _pool_key(pool: PoolMeshPlan | None) -> tuple | None:
@@ -78,6 +103,7 @@ def _pool_key(pool: PoolMeshPlan | None) -> tuple | None:
         pool.pp,
         pool.pcp,
         pool.kv_split,
+        pool.pp_layer_partition,
     )
 
 
@@ -131,12 +157,16 @@ def point_launch_args(
     kv_dtype: str = "auto",
     gpu_memory_utilization: float | None = None,
     model: str | None = None,
+    spec_tokens: int = 0,
+    mtp_layers: int = 0,
 ) -> dict[str, Any]:
     """Emit ``vllm serve`` CLI flags and commands for a single ParetoPoint."""
     decode_args = pool_cli_args(
         pt.decode_pool,
         kv_dtype=kv_dtype,
         gpu_memory_utilization=gpu_memory_utilization,
+        spec_tokens=spec_tokens,
+        mtp_layers=mtp_layers,
     )
     prefill_args = (
         pool_cli_args(
@@ -147,11 +177,21 @@ def point_launch_args(
         if pt.prefill_pool is not None
         else []
     )
-    decode_cmd = _format_server_cmd(decode_args, model)
+    decode_cmd = _format_server_cmd(
+        decode_args,
+        model,
+        pp_layer_partition=pt.decode_pool.pp_layer_partition,
+        moe_dispatch=pt.decode_pool.moe_dispatch,
+    )
     if pt.prefill_pool is not None:
         p_pool = pt.prefill_pool
         d_pool = pt.decode_pool
-        prefill_cmd = _format_server_cmd(prefill_args, model)
+        prefill_cmd = _format_server_cmd(
+            prefill_args,
+            model,
+            pp_layer_partition=p_pool.pp_layer_partition,
+            moe_dispatch=p_pool.moe_dispatch,
+        )
         commands = [
             f"# prefill ({p_pool.instances}x {p_pool.topology}): {prefill_cmd}",
             f"# decode ({d_pool.instances}x {d_pool.topology}): {decode_cmd}",
@@ -186,20 +226,37 @@ def emit_launch_args(
             "prefill_cli_args": [],
             "commands": [],
             "warnings": warnings,
-            "serving_plan": asdict(plan),
+            "serving_plan": _plan_dict(plan),
         }
 
+    eff_spec = (
+        plan.spec_tokens if plan.spec_tokens > 0 else (plan.scenario.spec_tokens or 0)
+    )
+    plan_mtp = plan.mtp_layers
+    if eff_spec > 0 and plan_mtp <= 0:
+        warnings.append(
+            "Model declares zero MTP draft layers; omitting --speculative-config."
+        )
     launch = point_launch_args(
         rec,
         kv_dtype=kv_str,
         gpu_memory_utilization=plan.gpu_memory_utilization,
         model=model,
+        spec_tokens=eff_spec,
+        mtp_layers=plan_mtp,
     )
     return {
         **launch,
         "warnings": warnings,
-        "serving_plan": asdict(plan),
+        "serving_plan": _plan_dict(plan),
     }
+
+
+def _plan_dict(plan: ServingPlan) -> dict[str, Any]:
+    """Convert ServingPlan to dict excluding sweep_candidates."""
+    data: dict[str, Any] = asdict(plan)
+    data.pop("sweep_candidates", None)
+    return data
 
 
 def build_solve_payload(
@@ -215,7 +272,7 @@ def build_solve_payload(
     Includes every ServingPlan key plus schema, provenance, chip, and Top-K.
     """
     kv_str = "fp8" if (dtypes is not None and dtypes.kv <= 1.0) else "auto"
-    payload: dict[str, Any] = asdict(plan)
+    payload: dict[str, Any] = _plan_dict(plan)
     payload["schema"] = SOLVE_SCHEMA
     payload["provenance"] = {
         "calibrated": False,
@@ -255,6 +312,10 @@ def build_solve_payload(
                 kv_dtype=kv_str,
                 gpu_memory_utilization=plan.gpu_memory_utilization,
                 model=model,
+                spec_tokens=plan.spec_tokens
+                if plan.spec_tokens > 0
+                else (plan.scenario.spec_tokens or 0),
+                mtp_layers=plan.mtp_layers,
             ),
         }
         for idx, pt in enumerate(top_pts)

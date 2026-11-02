@@ -639,3 +639,64 @@ def test_top_layouts_structural_diversity_and_interactivity_anchor() -> None:
     margins = [entry["margin_vs_rank1_pct"] for entry in payload["top_k"]]
     assert roles == ["max_throughput", "balanced_knee", "max_interactivity"]
     assert margins == [0.0, -16.0, -50.0]
+
+
+def test_emit_omits_mtp_speculative_config_when_mtp_layers_zero() -> None:
+    """Verify emit_launch_args omits --speculative-config when MTP layers is 0."""
+    scen = TrafficScenario(
+        name="custom",
+        isl=1024,
+        osl=128,
+        concurrencies=(16,),
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        kv_working_set_turns=1.0,
+        spec_tokens=3,
+    )
+    pool = PoolMeshPlan(
+        role="mixed",
+        instances=1,
+        tp=8,
+        dp=1,
+        pp=1,
+        pcp=1,
+        ep=1,
+        kv_split=1,
+        chips_per_instance=8,
+        topology="2x4",
+        mesh_axes=(2, 4),
+        hbm_used_gb=10.0,
+        hbm_limit_gb=94.76,
+    )
+    pt = ParetoPoint(
+        mode="mixed",
+        concurrency=16,
+        total_chips=8,
+        prefill_pool=None,
+        decode_pool=pool,
+        p90_ttft_ms=50.0,
+        p90_tpot_ms=20.0,
+        p90_interactivity_tok_s=50.0,
+        output_throughput_per_chip=100.0,
+        token_throughput_per_chip=1000.0,
+        p_mixed=0.0,
+        binding="mxu",
+        slo_met=True,
+    )
+    plan = ServingPlan(
+        model_layers=32,
+        chip="tpu7x",
+        scenario=scen,
+        mode="mixed",
+        recommended=pt,
+        frontier=(pt,),
+        warnings=(),
+        candidates=(pt,),
+        mtp_layers=0,
+        spec_tokens=3,
+    )
+    emitted = emit_launch_args(plan, dtypes=Dtypes(kv=1.0), model="test-model")
+    assert "--speculative-config" not in emitted["cli_args"]
+    assert "--speculative-config" not in emitted["commands"][0]
+    assert any("omitting --speculative-config" in w for w in emitted["warnings"])
