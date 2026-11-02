@@ -90,10 +90,15 @@ class ModuleCost:
     bf16_flops: float
     collectives: tuple[Collective, ...] = ()
     hbm_bytes_min: float | None = None
+    unique_collectives: tuple[tuple[Collective, int], ...] | None = None
 
     @property
     def ici_bytes(self) -> float:
         """Total inter-chip interconnect wire bytes across off-chip collectives."""
+        if self.unique_collectives is not None:
+            return sum(
+                c.wire_bytes * c.offchip * cnt for c, cnt in self.unique_collectives
+            )
         return sum(c.wire_bytes * c.offchip for c in self.collectives)
 
     @property
@@ -172,6 +177,15 @@ def _embed_collectives(rows: int, hidden: int, par: Parallel) -> tuple[Collectiv
     )
 
 
+def _repeat_colls(
+    base: tuple[Collective, ...], count: int
+) -> tuple[tuple[Collective, ...], tuple[tuple[Collective, int], ...]]:
+    """Repeat base collectives count times and build unique tally."""
+    if not base or count <= 0:
+        return (), ()
+    return base * count, tuple((c, count) for c in base)
+
+
 @dataclass(frozen=True)
 class _StepContext:
     """Internal evaluation context for one forward step."""
@@ -185,6 +199,7 @@ class _StepContext:
     batch: int
     rows_per_seq: int
     state_writes: int
+    mxu_m_tile: int = 1
 
 
 def _attn_layer_collectives(
@@ -240,16 +255,18 @@ def _attn_layer_collectives(
                     actual_par.ranks_per_chip,
                 )
             )
-            colls.append(
-                make(
-                    "out_rs",
-                    "rs",
-                    s_bytes,
-                    actual_par.tp,
-                    actual_par.ar_algo,
-                    actual_par.ranks_per_chip,
+            block_parallel = int(kwargs.get("block_parallel", 1))
+            if not (block_parallel > 1 and actual_par.moe_dispatch == "allreduce"):
+                colls.append(
+                    make(
+                        "out_rs",
+                        "rs",
+                        s_bytes,
+                        actual_par.tp,
+                        actual_par.ar_algo,
+                        actual_par.ranks_per_chip,
+                    )
                 )
-            )
     if is_full_attention and actual_par.kv_split > 1:
         g = actual_par.kv_split
         dec_rows = batch * rows_per_seq
@@ -348,7 +365,8 @@ def _moe_ag_ep_collectives(
             par.ranks_per_chip,
         ),
     ]
-    if par.residual == "replicated" and tp > 1:
+    block_parallel = int(kwargs.get("block_parallel", 1))
+    if par.residual == "replicated" and tp > 1 and block_parallel <= 1:
         colls.append(
             make(
                 "moe_ar",
@@ -366,6 +384,7 @@ def _moe_fused_rs_collectives(
     s_bytes: float,
     tp: int,
     par: Parallel,
+    **kwargs: int,
 ) -> tuple[Collective, ...]:
     """Return collectives for fused_rs MoE dispatch."""
     if tp <= 1:
@@ -375,10 +394,16 @@ def _moe_fused_rs_collectives(
             make("combine_rs", "rs", s_bytes, tp, par.ar_algo, par.ranks_per_chip),
             make("restore_ag", "ag", s_bytes, tp, par.ar_algo, par.ranks_per_chip),
         )
-    return (
-        make("dispatch_ag", "ag", s_bytes, tp, par.ar_algo, par.ranks_per_chip),
-        make("combine_rs", "rs", s_bytes, tp, par.ar_algo, par.ranks_per_chip),
+    block_parallel = int(kwargs.get("block_parallel", 1))
+    colls: list[Collective] = []
+    if block_parallel <= 1:
+        colls.append(
+            make("dispatch_ag", "ag", s_bytes, tp, par.ar_algo, par.ranks_per_chip)
+        )
+    colls.append(
+        make("combine_rs", "rs", s_bytes, tp, par.ar_algo, par.ranks_per_chip)
     )
+    return tuple(colls)
 
 
 def _moe_replicated_collectives(
@@ -387,12 +412,16 @@ def _moe_replicated_collectives(
     tp: int,
     disp_group: int,
     par: Parallel,
+    **kwargs: int,
 ) -> tuple[Collective, ...]:
     """Return collectives for replicated residual MoE dispatch."""
+    block_parallel = int(kwargs.get("block_parallel", 1))
     if par.moe_dispatch == "allreduce":
-        return (
-            make("moe_ar", "ar", s_bytes, tp, par.ar_algo, par.ranks_per_chip),
-        )
+        if block_parallel <= 1:
+            return (
+                make("moe_ar", "ar", s_bytes, tp, par.ar_algo, par.ranks_per_chip),
+            )
+        return ()
     colls: list[Collective] = [
         make(
             "dispatch_push",
@@ -429,9 +458,14 @@ def _moe_sp_collectives(
     """Return collectives for SP residual MoE dispatch."""
     tp = int(kwargs.get("tp", par.tp))
     disp_group = int(kwargs.get("disp_group", tp))
+    block_parallel = int(kwargs.get("block_parallel", 1))
     if par.moe_dispatch == "allreduce":
-        return (
-            make("dispatch_ag", "ag", s_bytes, tp, par.ar_algo, par.ranks_per_chip),
+        colls: list[Collective] = []
+        if block_parallel <= 1:
+            colls.append(
+                make("dispatch_ag", "ag", s_bytes, tp, par.ar_algo, par.ranks_per_chip)
+            )
+        colls.append(
             make(
                 "logits_ag",
                 "ag",
@@ -439,9 +473,12 @@ def _moe_sp_collectives(
                 tp,
                 par.ar_algo,
                 par.ranks_per_chip,
-            ),
-            make("combine_rs", "rs", s_bytes, tp, par.ar_algo, par.ranks_per_chip),
+            )
         )
+        colls.append(
+            make("combine_rs", "rs", s_bytes, tp, par.ar_algo, par.ranks_per_chip)
+        )
+        return tuple(colls)
     return (
         make(
             "dispatch_push",
@@ -468,6 +505,8 @@ def _moe_layer_collectives(
     num_experts: int,
     top_k: int,
     par: Parallel,
+    *,
+    block_parallel: int = 1,
 ) -> tuple[Collective, ...]:
     """Derive collectives for one MoE layer."""
     ep_ranks = par.ep if par.ep > 1 else par.tp
@@ -481,11 +520,19 @@ def _moe_layer_collectives(
         par.moe == "ep" and ep_ranks > tp and par.moe_dispatch == "allreduce"
     ):
         return _moe_ag_ep_collectives(
-            rows, hidden, num_experts, ep_ranks, par, tp=tp
+            rows,
+            hidden,
+            num_experts,
+            ep_ranks,
+            par,
+            tp=tp,
+            block_parallel=block_parallel,
         )
 
     if par.moe_dispatch == "fused_rs":
-        return _moe_fused_rs_collectives(s_bytes, tp, par)
+        return _moe_fused_rs_collectives(
+            s_bytes, tp, par, block_parallel=block_parallel
+        )
 
     disp_group = ep_ranks if par.moe_dispatch == "a2a_push" else tp
     push_wire = float(
@@ -496,9 +543,18 @@ def _moe_layer_collectives(
         * hidden
     )
     if par.residual == "replicated":
-        return _moe_replicated_collectives(s_bytes, push_wire, tp, disp_group, par)
+        return _moe_replicated_collectives(
+            s_bytes, push_wire, tp, disp_group, par, block_parallel=block_parallel
+        )
     return _moe_sp_collectives(
-        s_bytes, push_wire, mp, num_experts, par, tp=tp, disp_group=disp_group
+        s_bytes,
+        push_wire,
+        mp,
+        num_experts,
+        par,
+        tp=tp,
+        disp_group=disp_group,
+        block_parallel=block_parallel,
     )
 
 
@@ -590,20 +646,29 @@ _LAYER_TYPE_MAP: dict[str, str] = {
 
 def _count_layer_types(
     geom: ModelGeometry,
-) -> tuple[int, int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, int, float, float, float, float]:
     """Count occurrences of each layer type across model geometry."""
     counts = {"gqa": 0, "mla": 0, "dsa": 0, "swa": 0, "gdn": 0, "kda": 0}
-    for tok in geom.layer_types:
+    kv_ret = {"gqa": 0.0, "mla": 0.0, "dsa": 0.0, "swa": 0.0}
+    n_cr = len(geom.compress_ratios)
+    for idx, tok in enumerate(geom.layer_types):
+        r = geom.compress_ratios[idx] if idx < n_cr else 1.0
+        ret = (1.0 / r) if r > 1.0 else r
         mapped = _LAYER_TYPE_MAP.get(tok)
         if mapped:
             counts[mapped] += 1
+            if mapped in kv_ret:
+                kv_ret[mapped] += ret
         elif tok in ("full_attention", "attention"):
             if geom.kv_lora_rank > 0 and geom.index_topk > 0:
                 counts["dsa"] += 1
+                kv_ret["dsa"] += ret
             elif geom.kv_lora_rank > 0:
                 counts["mla"] += 1
+                kv_ret["mla"] += ret
             else:
                 counts["gqa"] += 1
+                kv_ret["gqa"] += ret
     return (
         counts["gqa"],
         counts["mla"],
@@ -611,6 +676,10 @@ def _count_layer_types(
         counts["swa"],
         counts["gdn"],
         counts["kda"],
+        kv_ret["gqa"],
+        kv_ret["mla"],
+        kv_ret["dsa"],
+        kv_ret["swa"],
     )
 
 
@@ -621,25 +690,28 @@ def _compute_gqa_cost(
     ctx: _StepContext,
     *,
     n_gqa: int,
+    kv_n_gqa: float = 0.0,
 ) -> ModuleCost:
     """Compute ModuleCost for GQA attention."""
     tp = par.tp
     n_eff = n_gqa * ctx.pp_scale
     kvh = max(1, geom.num_kv_heads // tp) if geom.num_kv_heads > 0 else 0
     q_mult = 2 if geom.attn_output_gate else 1
-    q_out = geom.num_heads * geom.head_dim * q_mult
+    gqa_hd = geom.global_head_dim if geom.global_head_dim > 0 else geom.head_dim
+    q_out = geom.num_heads * gqa_hd * q_mult
     att_w_elems = float(
         n_eff
         * (
             geom.hidden * (q_out // tp)
-            + 2 * geom.hidden * kvh * geom.head_dim
-            + (geom.num_heads // tp) * geom.head_dim * geom.hidden
+            + 2 * geom.hidden * kvh * gqa_hd
+            + (geom.num_heads // tp) * gqa_hd * geom.hidden
         )
     )
-    kv_dec_tokens = float(ctx.batch * ctx.context) / par.kv_split
+    gqa_kv_scale = (kv_n_gqa / float(n_gqa)) if geom.compress_ratios else 1.0
+    kv_dec_tokens = float(ctx.batch * ctx.context) * gqa_kv_scale / par.kv_split
     kv_pre_tokens = float(ctx.cached_prefix + ctx.eff_prefill)
     kv_bytes = (
-        float(kvh * geom.head_dim * 2)
+        float(kvh * gqa_hd * 2)
         * n_eff
         * (kv_dec_tokens + kv_pre_tokens)
         * dt.kv
@@ -651,7 +723,7 @@ def _compute_gqa_cost(
         ctx.decode_rows
         * 4
         * ctx.context
-        * geom.head_dim
+        * gqa_hd
         * (geom.num_heads // tp)
         * n_eff
     )
@@ -660,23 +732,24 @@ def _compute_gqa_cost(
         ctx.eff_prefill
         * 4
         * pre_ctx_eff
-        * geom.head_dim
+        * gqa_hd
         * (geom.num_heads // tp)
         * n_eff
     )
     n_colls_layers = max(1, round(n_eff))
-    att_colls = (
+    att_colls, att_ucolls = _repeat_colls(
         _attn_layer_collectives(
             ctx.batch,
             ctx.rows_per_seq,
             geom.hidden,
             geom.num_heads // tp,
-            geom.head_dim,
+            gqa_hd,
             par,
             is_full_attention=True,
             extra_rows=ctx.eff_prefill,
-        )
-        * n_colls_layers
+            block_parallel=geom.block_parallel,
+        ),
+        n_colls_layers,
     )
     return ModuleCost(
         name="gqa",
@@ -684,6 +757,7 @@ def _compute_gqa_cost(
         fp8_flops=att_fp8,
         bf16_flops=att_bf16 + dec_scores + pre_scores,
         collectives=att_colls,
+        unique_collectives=att_ucolls,
     )
 
 
@@ -775,7 +849,7 @@ def _compute_mla_dsa_costs(
                 f"{fam_name.upper()} layer requires config field 'qk_nope_head_dim'"
             )
             raise ValueError(msg)
-        if geom.qk_rope_head_dim <= 0:
+        if geom.qk_rope_head_dim < 0:
             msg = (
                 f"{fam_name.upper()} layer requires config field 'qk_rope_head_dim'"
             )
@@ -807,14 +881,18 @@ def _compute_mla_dsa_costs(
             else ctx.context
         )
         latent_width = kv_lora + rope_d
-        kv_tokens = float(ctx.batch * att_ctx) / par.kv_split + float(
-            ctx.cached_prefix + ctx.eff_prefill
+        kv_n_fam = kwargs.get(f"kv_n_{fam_name}", float(n_fam))
+        fam_kv_scale = (kv_n_fam / float(n_fam)) if geom.compress_ratios else 1.0
+        kv_tokens = (
+            float(ctx.batch * att_ctx) * fam_kv_scale / par.kv_split
+            + float(ctx.cached_prefix + ctx.eff_prefill)
         )
         mla_kv_bytes = n_eff * kv_tokens * float(latent_width) * dt.kv
         if is_sparse and geom.index_head_dim > 0 and ctx.context > 0:
             mla_kv_bytes += (
                 n_eff
                 * float(ctx.batch * ctx.context * geom.index_head_dim)
+                * fam_kv_scale
                 * dt.kv
                 / par.kv_split
             )
@@ -832,16 +910,20 @@ def _compute_mla_dsa_costs(
             * (kv_lora + rope_d + kv_lora)
             * n_eff
         )
-        mla_colls = _attn_layer_collectives(
-            ctx.batch,
-            ctx.rows_per_seq,
-            geom.hidden,
-            nq,
-            kv_lora,
-            par,
-            is_full_attention=True,
-            extra_rows=ctx.eff_prefill,
-        ) * max(1, round(n_eff))
+        mla_colls, mla_ucolls = _repeat_colls(
+            _attn_layer_collectives(
+                ctx.batch,
+                ctx.rows_per_seq,
+                geom.hidden,
+                nq,
+                kv_lora,
+                par,
+                is_full_attention=True,
+                extra_rows=ctx.eff_prefill,
+                block_parallel=geom.block_parallel,
+            ),
+            max(1, round(n_eff)),
+        )
         out.append(
             ModuleCost(
                 name=fam_name,
@@ -849,6 +931,7 @@ def _compute_mla_dsa_costs(
                 fp8_flops=mla_fp8,
                 bf16_flops=mla_bf16 + mla_scores,
                 collectives=mla_colls,
+                unique_collectives=mla_ucolls,
             )
         )
     return out
@@ -891,16 +974,20 @@ def _compute_gdn_cost(
     gdn_rec_flops = float(
         ctx.rows * 4 * vh * geom.linear_k_dim * geom.linear_v_dim * n_eff
     )
-    gdn_colls = _attn_layer_collectives(
-        ctx.batch,
-        ctx.rows_per_seq,
-        geom.hidden,
-        geom.num_heads // tp,
-        geom.head_dim,
-        par,
-        is_full_attention=False,
-        extra_rows=ctx.eff_prefill,
-    ) * max(1, round(n_eff))
+    gdn_colls, gdn_ucolls = _repeat_colls(
+        _attn_layer_collectives(
+            ctx.batch,
+            ctx.rows_per_seq,
+            geom.hidden,
+            geom.num_heads // tp,
+            geom.head_dim,
+            par,
+            is_full_attention=False,
+            extra_rows=ctx.eff_prefill,
+            block_parallel=geom.block_parallel,
+        ),
+        max(1, round(n_eff)),
+    )
     return ModuleCost(
         name="gdn",
         hbm_bytes=(
@@ -911,6 +998,7 @@ def _compute_gdn_cost(
         fp8_flops=dense_fp8 + aux_fp8,
         bf16_flops=dense_bf16 + aux_bf16 + gdn_rec_flops,
         collectives=gdn_colls,
+        unique_collectives=gdn_ucolls,
     )
 
 
@@ -942,22 +1030,27 @@ def _compute_kda_cost(
         ctx.rows, kda_w_elems, dt.w_dense, dt.act
     )
     kda_rec_flops = float(ctx.rows * 4 * vh * kd * vd * n_eff)
-    kda_colls = _attn_layer_collectives(
-        ctx.batch,
-        ctx.rows_per_seq,
-        geom.hidden,
-        nq,
-        vd,
-        par,
-        is_full_attention=False,
-        extra_rows=ctx.eff_prefill,
-    ) * max(1, round(n_eff))
+    kda_colls, kda_ucolls = _repeat_colls(
+        _attn_layer_collectives(
+            ctx.batch,
+            ctx.rows_per_seq,
+            geom.hidden,
+            nq,
+            vd,
+            par,
+            is_full_attention=False,
+            extra_rows=ctx.eff_prefill,
+            block_parallel=geom.block_parallel,
+        ),
+        max(1, round(n_eff)),
+    )
     return ModuleCost(
         name="kda",
         hbm_bytes=kda_w_elems * dt.w_dense + kda_state_bytes,
         fp8_flops=kda_fp8,
         bf16_flops=kda_bf16 + kda_rec_flops,
         collectives=kda_colls,
+        unique_collectives=kda_ucolls,
     )
 
 
@@ -1031,15 +1124,35 @@ def _compute_routed_moe_cost(
     r_fp8, r_bf16 = _split_matmul_flops(
         routed_rows, routed_act_elems, dt.w_expert, dt.act
     )
+    if ctx.mxu_m_tile > 1 and routed_rows > 0 and ed > 0.0 and geom.top_k > 0:
+        ed_global = (
+            experts_touched(geom.num_experts, geom.top_k, routed_rows)
+            if par.moe == "ep"
+            else ed
+        )
+        m_per_touched = float(routed_rows * geom.top_k) / max(1.0, ed_global)
+        if m_per_touched > 0.0:
+            m_pad = float(math.ceil(m_per_touched / ctx.mxu_m_tile) * ctx.mxu_m_tile)
+            pad_mult = m_pad / m_per_touched
+            r_fp8 *= pad_mult
+            r_bf16 *= pad_mult
     s_fp8, s_bf16 = _split_matmul_flops(
         sh_rows, shared_elems, dt.w_dense, dt.act
     )
     rt_fp8, rt_bf16 = _split_matmul_flops(
         ctx.rows, router_elems, dt.router, dt.act
     )
-    moe_colls = _moe_layer_collectives(
-        ctx.rows, geom.hidden, geom.num_experts, geom.top_k, par
-    ) * max(1, round(n_m_eff))
+    moe_colls, moe_ucolls = _repeat_colls(
+        _moe_layer_collectives(
+            ctx.rows,
+            geom.hidden,
+            geom.num_experts,
+            geom.top_k,
+            par,
+            block_parallel=geom.block_parallel,
+        ),
+        max(1, round(n_m_eff)),
+    )
     return ModuleCost(
         name="moe",
         hbm_bytes=moe_w_bytes,
@@ -1047,6 +1160,7 @@ def _compute_routed_moe_cost(
         bf16_flops=r_bf16 + s_bf16 + rt_bf16,
         collectives=moe_colls,
         hbm_bytes_min=moe_w_bytes_min,
+        unique_collectives=moe_ucolls,
     )
 
 
@@ -1175,15 +1289,17 @@ def _compute_lm_head_cost(
     lm_fp8, lm_bf16 = _split_matmul_flops(
         ctx.rows, lm_elems, dt.lm_head, dt.act
     )
+    lm_all_colls = (
+        _lm_head_collectives(ctx.rows, geom.hidden, geom.vocab, par) + pp_colls
+    )
+    lm_colls, lm_ucolls = _repeat_colls(lm_all_colls, 1)
     return ModuleCost(
         name="lm_head",
         hbm_bytes=lm_elems * dt.lm_head,
         fp8_flops=lm_fp8,
         bf16_flops=lm_bf16,
-        collectives=_lm_head_collectives(
-            ctx.rows, geom.hidden, geom.vocab, par
-        )
-        + pp_colls,
+        collectives=lm_colls,
+        unique_collectives=lm_ucolls,
     )
 
 
@@ -1192,6 +1308,8 @@ def pass_costs(
     par: Parallel,
     shape: StepShape,
     dt: Dtypes,
+    *,
+    mxu_m_tile: int = 1,
 ) -> tuple[ModuleCost, ...]:
     """Compute per-module resource work for one decode, prefill, or mixed pass."""
     _validate_pass_costs_config(geom, par)
@@ -1231,29 +1349,56 @@ def pass_costs(
         batch=shape.batch,
         rows_per_seq=shape.rows_per_seq,
         state_writes=shape.state_writes,
+        mxu_m_tile=mxu_m_tile,
     )
 
-    n_gqa, n_mla, n_dsa, n_swa, n_gdn, n_kda = _count_layer_types(geom)
+    (
+        n_gqa,
+        n_mla,
+        n_dsa,
+        n_swa,
+        n_gdn,
+        n_kda,
+        kv_n_gqa,
+        kv_n_mla,
+        kv_n_dsa,
+        _,
+    ) = _count_layer_types(geom)
 
+    emb_colls, emb_ucolls = _repeat_colls(
+        _embed_collectives(rows, geom.hidden, par), 1
+    )
     out: list[ModuleCost] = [
         ModuleCost(
             name="embed",
             hbm_bytes=0.0,
             fp8_flops=0.0,
             bf16_flops=0.0,
-            collectives=_embed_collectives(rows, geom.hidden, par),
+            collectives=emb_colls,
+            unique_collectives=emb_ucolls,
         )
     ]
 
     if n_gqa > 0:
-        out.append(_compute_gqa_cost(geom, par, dt, ctx, n_gqa=n_gqa))
+        out.append(
+            _compute_gqa_cost(geom, par, dt, ctx, n_gqa=n_gqa, kv_n_gqa=kv_n_gqa)
+        )
 
     if n_swa > 0:
         out.append(_compute_swa_cost(geom, par, dt, ctx, n_swa=n_swa))
 
     if n_mla > 0 or n_dsa > 0:
         out.extend(
-            _compute_mla_dsa_costs(geom, par, dt, ctx, n_mla=n_mla, n_dsa=n_dsa)
+            _compute_mla_dsa_costs(
+                geom,
+                par,
+                dt,
+                ctx,
+                n_mla=n_mla,
+                n_dsa=n_dsa,
+                kv_n_mla=kv_n_mla,
+                kv_n_dsa=kv_n_dsa,
+            )
         )
 
     if n_gdn > 0:

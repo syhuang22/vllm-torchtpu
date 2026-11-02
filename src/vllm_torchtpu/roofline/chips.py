@@ -43,6 +43,7 @@ class ChipSpec:
     cores_per_chip: int = 2
     ici_link_bw: float = 100.0e9
     ici_hop_latency_s: float = 1.0e-6
+    mxu_m_tile: int = 256
 
 
 _FALLBACK_TPU_SPECS: dict[str, tuple[int, float, float, float, int]] = {
@@ -59,6 +60,7 @@ def from_jax(
     ici_link_bw: float = 100.0e9,
     ici_bw: float = 300.0e9,
     ici_hop_latency_s: float = 1.0e-6,
+    mxu_m_tile: int = 256,
 ) -> ChipSpec:
     """Construct ChipSpec from JAX TPU info table or stdlib fallback table."""
     if pltpu is None:
@@ -73,6 +75,7 @@ def from_jax(
             ici_link_bw=ici_link_bw,
             ici_bw=ici_bw,
             ici_hop_latency_s=ici_hop_latency_s,
+            mxu_m_tile=mxu_m_tile,
         )
     # One TensorCore per logical device gives per-core HBM, bandwidth, MXU peaks,
     # and VMEM; JAX's table has no ICI rates, so callers pass them.
@@ -87,6 +90,7 @@ def from_jax(
         ici_link_bw=ici_link_bw,
         ici_bw=ici_bw,
         ici_hop_latency_s=ici_hop_latency_s,
+        mxu_m_tile=mxu_m_tile,
     )
 
 
@@ -144,6 +148,9 @@ CHIPS: dict[str, ChipSpec] = {
         # Your Model states for TPU v5e (https://jax-ml.github.io/scaling-book/tpus/);
         # no TPU7x value is published.
         ici_hop_latency_s=1.0e-6,
+        # 256x256 systolic array contraction tile: Google Cloud TPU7x docs
+        # (https://cloud.google.com/tpu/docs/tpu7x).
+        mxu_m_tile=256,
     ),
 }
 

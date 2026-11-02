@@ -24,9 +24,11 @@ import pytest
 
 import vllm_torchtpu.roofline as rf
 from vllm_torchtpu.roofline import cli
+from vllm_torchtpu.roofline.geometry import from_hf_config
 from vllm_torchtpu.roofline.solver import (
     _candidate_decode_parallels,
     _candidate_prefill_parallels,
+    _compute_w_ffn,
     _count_full_attn_layers,
     _default_rpa_page_size,
     _kv_capacity_and_hit_rate,
@@ -1119,3 +1121,62 @@ def test_hbm_breakdown_dsa_indexer_weights_and_mla_gqa_parity() -> None:
     expected_idx_w = float(4 * 4096 * (64 // 4) * 128) * 1.0
     assert bd_idx.weights - bd_no_idx.weights == pytest.approx(expected_idx_w, rel=1e-6)
     assert bd_gqa_tok == bd_idx
+
+
+def test_hbm_breakdown_per_core_bytes_exact_hand_formula() -> None:
+    """Verify HBM breakdown matches closed-form formulas for GQA/SWA and MoE."""
+    cfg_a = {
+        "architectures": ["LlamaForCausalLM"],
+        "hidden_size": 2048,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "global_head_dim": 512,
+        "sliding_window": 128,
+        "intermediate_size": 4096,
+        "vocab_size": 32000,
+        "num_hidden_layers": 2,
+        "layer_types": ["sliding_attention", "full_attention"],
+    }
+    geom_a = from_hf_config(cfg_a)
+    par = Parallel(tp=1, pp=1)
+    dt = Dtypes()
+    bd_a = hbm_breakdown_per_core_bytes(
+        geom_a, dt, par, seqs_per_dp=1, context=512, physical_kv_layout=False
+    )
+    expected_weights_a = 20_971_520.0 + 10_485_760.0 + 50_331_648.0 + 262_144_000.0
+    expected_kv_a = 1_048_576.0 + 131_072.0
+    assert bd_a.weights == expected_weights_a
+    assert bd_a.kv == expected_kv_a
+
+    nemotron_cfg = {
+        "model_type": "nemotron_h",
+        "hidden_size": 2048,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "mamba_num_heads": 32,
+        "mamba_head_dim": 64,
+        "conv_kernel": 4,
+        "hybrid_override_pattern": "M-M*ME",
+        "n_routed_experts": 8,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 1024,
+        "intermediate_size": 4096,
+        "vocab_size": 32000,
+    }
+    geom_b = from_hf_config(nemotron_cfg)
+    n_moe_ffn, n_dense_ffn = geom_b.ffn_layer_counts()
+    assert (n_moe_ffn, n_dense_ffn) == (1, 1)
+    w_ffn, w_dense_ffn = _compute_w_ffn(geom_b, dt, Parallel(tp=1, pp=1, moe="ep"))
+    expected_dense_b = (
+        float(n_dense_ffn * 3 * geom_b.hidden * geom_b.dense_inter) * dt.w_dense
+    )
+    expected_moe_b = (
+        float(n_moe_ffn * geom_b.num_experts * 3 * geom_b.hidden * geom_b.moe_inter)
+        * dt.w_expert
+        + float(n_moe_ffn * geom_b.hidden * geom_b.num_experts) * dt.router
+    )
+    assert w_dense_ffn == expected_dense_b
+    assert w_ffn == expected_dense_b + expected_moe_b
