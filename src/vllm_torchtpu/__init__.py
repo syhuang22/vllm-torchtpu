@@ -674,6 +674,45 @@ def _patch_sequence_parallel_moe_admission() -> None:
     )
 
 
+class _LargePipeOs:
+    """`os` for multiprocessing.popen_spawn_posix, whose pipes it enlarges.
+
+    Spawning a worker writes the pickled process object (vllm_config
+    included) into a pipe the child reads only after it has started Python
+    and re-imported the main module, several seconds later. With the default
+    64 KiB pipe that write blocks the parent until then, so vLLM's spawn loop
+    starts the workers one after another, about 6 s apart for 8 workers. A
+    pipe as large as the payload lets the write return at once, so every
+    worker imports in parallel. Everything else is `os` itself.
+    """
+
+    def __getattr__(self, name: str):
+        import os
+
+        return getattr(os, name)
+
+    @staticmethod
+    def pipe() -> tuple[int, int]:
+        import fcntl
+        import os
+
+        r, w = os.pipe()
+        size = None
+        try:
+            with open("/proc/sys/fs/pipe-max-size") as f:
+                size = int(f.read())
+            fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, size)
+        except (OSError, ValueError) as e:
+            # The default pipe still works; workers just start one by one.
+            logger.warning_once(
+                "Could not enlarge the worker spawn pipe to %s bytes (%s); "
+                "workers will start serially.",
+                size,
+                e,
+            )
+        return r, w
+
+
 def _patch_multiproc_worker_global_rank_env() -> None:
     """Set TorchTPU binding env on spawned workers before torch_tpu import.
 
@@ -728,7 +767,17 @@ def _patch_multiproc_worker_global_rank_env() -> None:
             binding.local_rank_offset,
             binding.init_local_rank,
         )
-        return _orig(vllm_config, local_rank, rank, *args, **kwargs)
+        # Large pipes for this spawn only. Swapping the module global is safe
+        # because workers are spawned from one thread:
+        # TpuMultiprocExecutor._can_start_workers_concurrently returns False.
+        import multiprocessing.popen_spawn_posix as popen_spawn_posix
+
+        spawn_os = popen_spawn_posix.os
+        popen_spawn_posix.os = _LargePipeOs()
+        try:
+            return _orig(vllm_config, local_rank, rank, *args, **kwargs)
+        finally:
+            popen_spawn_posix.os = spawn_os
 
     WorkerProc.make_worker_process = staticmethod(_wrapped)
     WorkerProc._tpu_global_rank_env_patch = True
