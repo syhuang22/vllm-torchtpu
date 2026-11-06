@@ -2,10 +2,7 @@
 
 Prefill/Decode (P/D) disaggregation separates compute-bound **Prefill** (`kv_producer`) and memory-bandwidth-bound **Decode** (`kv_consumer`) onto independent TPU engine pools. This prevents long-prompt prefills from stalling ongoing decode steps (eliminating TPOT spikes) and allows each pool to use the parallelism layout (`TP`, `DP`, `PCP`, `EP`) best suited to its phase.
 
-`vllm-torchtpu` supports two KV cache transfer connectors:
-
-1. **Raiden KV Connector (`TpuRaidenConnector`)**: High-bandwidth PJRT DMA/RDMA engine powered by `tpu-sync-torch` (`tpu_sync`) with a central coordinator (`run_raiden_controller.py`) and support for **heterogeneous P/D resharding** (e.g., Prefill with `PCP=4, TP=2` transferring KV cache into Decode with `DP=8, TP=1`).
-2. **Host TCP/Side-Channel Connector (`TPUConnector`)**: Lightweight single-host or multi-host connector for functional testing and local disaggregation (`examples/disagg/run_disagg_single_host.sh`).
+`vllm-torchtpu` transfers KV cache through the **Raiden KV Connector (`TpuRaidenConnector`)**: a high-bandwidth PJRT DMA/RDMA engine powered by `tpu-sync-torch` (`tpu_sync`) with a central coordinator (`run_raiden_controller.py`) and support for **heterogeneous P/D resharding** (e.g., Prefill with `PCP=4, TP=2` transferring KV cache into Decode with `DP=8, TP=1`). `TPUConnector` remains as a name for the same Raiden backend; it no longer has a ZMQ/shared-memory fallback and fails at startup unless Raiden is selected (`TPU_KV_RESHARD_TRANSPORT=raiden`).
 
 ---
 
@@ -20,23 +17,7 @@ A production Raiden P/D deployment consists of four components:
 
 ---
 
-## 2. Single-Host Disaggregated Serving Quickstart
-
-On an 8-device TPU host, you can launch a complete Prefill + Decode + Proxy pipeline using `examples/disagg/run_disagg_single_host.sh`:
-
-```bash
-MODEL="Qwen/Qwen3-0.6B" \
-INPUT_LEN=512 \
-OUTPUT_LEN=128 \
-NUM_PROMPTS=200 \
-bash examples/disagg/run_disagg_single_host.sh
-```
-
-The script pins separate `/dev/vfio/<N>` devices to the Prefill (`kv_producer`) and Decode (`kv_consumer`) `vllm serve` processes, starts `examples/disagg/toy_proxy_server.py` on port `8000`, and runs `vllm bench serve` against the proxy.
-
----
-
-## 3. Multi-Host Disaggregated Serving with Raiden (`TpuRaidenConnector`)
+## 2. Multi-Host Disaggregated Serving with Raiden (`TpuRaidenConnector`)
 
 For large models such as `Qwen/Qwen3.5-397B-A17B`, `Qwen/Qwen3.5-35B-A3B-FP8`, `moonshotai/Kimi-K3`, and `deepseek-ai/DeepSeek-V4`, use `TpuRaidenConnector` with `TPU_USE_RAIDEN_KV_CACHE_MANAGER=1`.
 
@@ -112,7 +93,7 @@ python examples/disagg/toy_proxy_server.py \
 
 ---
 
-## 4. Decode Capacity Preemption & Error Contract
+## 3. Decode Capacity Preemption & Error Contract
 
 When a Decode instance (`kv_role="kv_consumer"`) runs with `kv_load_failure_policy="fail"` (the upstream vLLM default), `vllm-torchtpu` aborts `RUNNING` requests that are evicted due to KV cache capacity pressure instead of returning them to `waiting` to recompute prompts locally on the decode pool. Administrative prefix cache resets (`reset_prefix_cache`) continue to requeue requests without aborting them.
 
@@ -150,7 +131,7 @@ Capacity-preemption abort follows `kv_load_failure_policy` by default (`"fail"` 
 
 ---
 
-## 5. Reference Launch Scripts & GKE Manifests
+## 4. Reference Launch Scripts & GKE Manifests
 
 | Script / Manifest | Description |
 | :--- | :--- |
@@ -162,7 +143,7 @@ Capacity-preemption abort follows `kv_load_failure_policy` by default (`"fail"` 
 
 ---
 
-## 6. Key Raiden Environment Variables
+## 5. Key Raiden Environment Variables
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
@@ -172,4 +153,4 @@ Capacity-preemption abort follows `kv_load_failure_policy` by default (`"fail"` 
 | `TPU_RAIDEN_ENGINE_ID` | `"0"` | Unique engine replica ID within the job role. |
 | `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of concurrent DMA transfer streams per worker. |
 | `TPU_RAIDEN_RESHARD_IMPL` | `"controller"` | KV resharding implementation (`controller` or `host`) when Prefill and Decode shardings differ. |
-| `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | Transport protocol for host-side KV resharding (`zmq` or `tcp`). |
+| `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | Set to `raiden` to enable the controller-planned Stage-3 reshard path (required for `TPUConnector`); `zmq` only keeps the legacy non-Stage-3 Raiden path. |

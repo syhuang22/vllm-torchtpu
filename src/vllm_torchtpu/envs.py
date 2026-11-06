@@ -151,22 +151,13 @@ if TYPE_CHECKING:
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
     TPU_KV_TRANSFER_CHANNEL_NUMBER: int = 0
-    TPU_KV_COORD_EXECUTOR_MAX_WORKERS: int = 0
-    TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS: int = 0
-    TPU_KV_STAGE_WAITER_POOL_SIZE: int = 0
     TPU_P2P_WAIT_PULL_TIMEOUT: int = 120
     TPU_RAIDEN_STAGE3_STATUS_PROBE_S: float = 1.0
     TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT: bool = True
     TPU_RAIDEN_STAGE3_REGISTER_AHEAD: bool = True
     TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S: float = 30.0
     TPU_RAIDEN_TEST_REGISTRATION_DELAY_S: float = 0.0
-    TPU_KV_STAGE_WAIT_TIMEOUT_SECS: float = 30.0
     TPU_KV_SHM_POOL_GB: float = 128.0
-    TPU_KV_TRANSFER_NAMESPACE: str = ""
-    TPU_IPC_SOCKET_DIR: str = "/tmp"
-    TPU_KV_WARMUP_ENABLED: bool = True
-    TPU_KV_LATENCY_LOG_INTERVAL: float = 30.0
-    TPU_KV_PIN_SHM: bool = False
     TPU_USE_RAIDEN_CONNECTOR: bool = False
     TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
@@ -637,9 +628,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # indexer, HCA, SWA and the compressor states. Every other model here has
     # exactly one.
     "TPU_RAIDEN_DSV4_ADMISSION": env_bool("TPU_RAIDEN_DSV4_ADMISSION"),
-    # Controller-driven PCP->DP pool resharding. The default preserves
-    # the existing v1 connector protocol; selecting ``raiden`` enables
-    # the fail-closed controller path.
+    # Controller-driven Raiden Stage-3 pool resharding. ``raiden`` enables
+    # the fail-closed controller path; the ``zmq`` default only remains for
+    # the legacy (non-Stage-3) Raiden connector selected via
+    # TPU_USE_RAIDEN_CONNECTOR / use_raiden_connector.
     "TPU_KV_RESHARD_TRANSPORT": env_with_choices(
         "TPU_KV_RESHARD_TRANSPORT", "zmq", ["zmq", "raiden"], case_sensitive=False
     ),
@@ -1074,20 +1066,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SIDE_CHANNEL_PORT": env_str("TPU_SIDE_CHANNEL_PORT", "9600"),
     # Host ordinal within a multi-host slice.
     "TPU_NODE_ID": env_int("TPU_NODE_ID", 0),
-    # 0 means auto; a non-zero override is clamped to tp_size downstream.
+    # Per-node KV port stride for Ray multi-host advertising; 0 means auto
+    # (tp_size), a non-zero override is clamped to tp_size downstream.
     "TPU_KV_TRANSFER_CHANNEL_NUMBER": env_int("TPU_KV_TRANSFER_CHANNEL_NUMBER", 0),
-    # Request-level pull executor size; 0 means auto.
-    "TPU_KV_COORD_EXECUTOR_MAX_WORKERS": env_nonnegative_int(
-        "TPU_KV_COORD_EXECUTOR_MAX_WORKERS", 0
-    ),
-    # Channel-level pull executor size; 0 means auto.
-    "TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS": env_nonnegative_int(
-        "TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS", 0
-    ),
-    # Worker count for the stage waiter pool; 0 means auto (4).
-    "TPU_KV_STAGE_WAITER_POOL_SIZE": env_nonnegative_int(
-        "TPU_KV_STAGE_WAITER_POOL_SIZE", 0
-    ),
     # KV-cache transfer timeout, in seconds.
     "TPU_P2P_WAIT_PULL_TIMEOUT": env_int("TPU_P2P_WAIT_PULL_TIMEOUT", 120),
     # Seconds; 0 disables the probe.
@@ -1112,20 +1093,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S": env_float(
         "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S", 0.0
     ),
-    # Seconds; non-positive falls back to 30 downstream.
-    "TPU_KV_STAGE_WAIT_TIMEOUT_SECS": env_float("TPU_KV_STAGE_WAIT_TIMEOUT_SECS", 30.0),
-    # Total GB budget for the per-host shared-memory KV staging pool.
+    # Per-host GB budget for legacy (non-Stage-3) Raiden host staging slots.
     "TPU_KV_SHM_POOL_GB": env_float("TPU_KV_SHM_POOL_GB", 128.0),
-    # Optional engine namespace; sanitized at the call site.
-    "TPU_KV_TRANSFER_NAMESPACE": env_str("TPU_KV_TRANSFER_NAMESPACE", ""),
-    # Directory holding the per-host intra-process IPC socket.
-    "TPU_IPC_SOCKET_DIR": env_str("TPU_IPC_SOCKET_DIR", "/tmp"),
-    # Pre-compile KV gather/scatter executables at startup.
-    "TPU_KV_WARMUP_ENABLED": env_bool("TPU_KV_WARMUP_ENABLED", default=True),
-    # Seconds; 0 disables the periodic summaries.
-    "TPU_KV_LATENCY_LOG_INTERVAL": env_float("TPU_KV_LATENCY_LOG_INTERVAL", 30.0),
-    # mlock(2) the KV shm pool at startup.
-    "TPU_KV_PIN_SHM": env_bool("TPU_KV_PIN_SHM", default=False),
     # kv_connector_extra_config.use_raiden_connector takes precedence.
     "TPU_USE_RAIDEN_CONNECTOR": env_bool("TPU_USE_RAIDEN_CONNECTOR", default=False),
     # 0 means auto-size from TPU_KV_SHM_POOL_GB, split across TP ranks.

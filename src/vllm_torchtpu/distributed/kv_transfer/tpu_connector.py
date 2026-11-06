@@ -14,19 +14,11 @@
 """
 TPUConnector: KV-cache connector for P/D disaggregated serving on TPU.
 
-Ported from vllm_torchtpu/distributed/tpu_connector.py in the tpu-inference
-(JAX) project, with the JAX transfer-server data plane replaced by a ZMQ-based
-pull-on-demand transport that moves torch tensors over the TPU host network.
-
-The default generic shm-staged ZMQ machinery lives in
-``vllm_torchtpu.distributed.kv_transfer.zmq_shm_base.ZmqShmKvConnectorBase``;
-this file holds the TPU-specific transport hooks plus the scheduler half
-of the connector. A Raiden C++ transfer backend is available as an opt-in
-alternative via ``kv_connector_extra_config.use_raiden_connector``.
-
-P/D disagg of GDN models which mixing attention and Mamba layers is available
-either via the dedicated ``TPUConnectorHMA`` connector class or via
-``kv_connector_extra_config.use_hma_connector``.
+KV blocks move between prefill and decode engines through the Raiden
+(tpu-sync) C++ transfer backend. Set ``TPU_KV_RESHARD_TRANSPORT=raiden``
+together with a Raiden pool admission flag to use the controller-planned
+Stage-3 reshard path. ``TPURaidenConnector`` always selects the Raiden
+backend. The ZMQ-shm backend that used to be the default has been removed.
 """
 
 import dataclasses
@@ -43,12 +35,6 @@ from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import torch
-from torch_tpu._internal.batch_transfer import (
-    batch_transfer_d2h,
-    batch_transfer_d2h_sync,
-    batch_transfer_h2d,
-    batch_transfer_h2d_sync,
-)
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -81,7 +67,6 @@ if TYPE_CHECKING:
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.distributed.kv_transfer import kv_scatter
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     LoadMeta,
     ReqId,
@@ -97,14 +82,6 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics,
     TpuKVConnectorStats,
 )
-
-# zmq/shm transport pieces: used only by the zmq-stack workers below
-# (TPUConnectorWorker), not by the Raiden connector.
-from vllm_torchtpu.distributed.kv_transfer.zmq_shm_base import (
-    ZmqShmKvConnectorBase,
-    _CoordRecvEntry,
-    _CoordSendEntry,
-)
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
@@ -118,15 +95,12 @@ logger = init_logger(__name__)
 __all__ = [
     "TPUConnector",
     "TPUConnectorScheduler",
-    "TPUConnectorWorker",
     "TPURaidenConnector",
     "TPURaidenConnectorScheduler",
     "TPURaidenConnectorWorker",
     "TPUConnectorMetadata",
     "SendMeta",
     "LoadMeta",
-    "_CoordSendEntry",
-    "_CoordRecvEntry",
     "stage3_fa_raiden_id_fields",
 ]
 
@@ -820,15 +794,18 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                 "vLLM produced a MambaSpec with a negative speculative "
                 f"depth: value={stage3_mamba_num_speculative_blocks}"
             )
-        if use_raiden:
-            scheduler_cls = TPURaidenConnectorScheduler
-            worker_cls = TPURaidenConnectorWorker
-            backend = "Raiden"
-        else:
-            scheduler_cls = TPUConnectorScheduler
-            worker_cls = TPUConnectorWorker
-            backend = "ZMQ-shm"
-        logger.info("TPUConnector --> using %s backend", backend)
+        if not use_raiden:
+            raise ValueError(
+                "TPUConnector no longer ships the ZMQ-shm KV transfer backend. "
+                "Use the Raiden (tpu-sync) backend: set "
+                "TPU_KV_RESHARD_TRANSPORT=raiden together with "
+                "TPU_USE_RAIDEN_KV_CACHE_MANAGER=1 and a Raiden pool admission "
+                "flag (e.g. TPU_RAIDEN_QWEN35_ADMISSION=1), or select "
+                "kv_connector=TPURaidenConnector."
+            )
+        scheduler_cls = TPURaidenConnectorScheduler
+        worker_cls = TPURaidenConnectorWorker
+        logger.info("TPUConnector --> using Raiden backend")
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = scheduler_cls(vllm_config)
@@ -1374,135 +1351,6 @@ class TPUConnectorScheduler:
             kv_transfer_params = {}
 
         return delay_free_blocks, kv_transfer_params
-
-
-class TPUConnectorWorker(ZmqShmKvConnectorBase):
-    """TPU-specific transport hooks for the generic ZmqShmKvConnectorBase."""
-
-    def process_send_load(
-        self,
-        metadata: TPUConnectorMetadata,
-        wait_for_completion: bool = False,
-        report_completion: bool = True,
-    ) -> None:
-        del wait_for_completion, report_completion
-        super().process_send_load(metadata)
-
-    def _build_d2h_views(
-        self, slot_idx: int, num_blocks: int, block_ids: list[int]
-    ) -> tuple[list, list, int]:
-        indices = torch.tensor(block_ids, dtype=torch.int64, device=self.device)
-        assert self.runner is not None
-        kv_caches = self.runner.kv_caches
-        tpu_tensors: list = []
-        cpu_tensors: list = []
-        d2h_total_bytes = 0
-        assert self._coord_pool is not None
-        for layer_idx, cache in enumerate(kv_caches):
-            src_shard = torch.index_select(cache, 0, indices)
-            dest_view = self._coord_pool.layer_view(
-                slot_idx, self.local_tp_rank, layer_idx, num_blocks
-            )
-            tpu_tensors.append(src_shard)
-            cpu_tensors.append(dest_view)
-            d2h_total_bytes += dest_view.numel() * dest_view.element_size()
-        return tpu_tensors, cpu_tensors, d2h_total_bytes
-
-    def _stage_d2h(
-        self, slot_idx: int, num_blocks: int, block_ids: list[int]
-    ) -> tuple[Any, list, list, int]:
-        tpu_tensors, cpu_tensors, total_bytes = self._build_d2h_views(
-            slot_idx, num_blocks, block_ids
-        )
-        future = batch_transfer_d2h(tpu_tensors, cpu_tensors)
-        return future, tpu_tensors, cpu_tensors, total_bytes
-
-    def _stage_d2h_sync(
-        self, slot_idx: int, num_blocks: int, block_ids: list[int]
-    ) -> None:
-        tpu_tensors, cpu_tensors, _ = self._build_d2h_views(
-            slot_idx, num_blocks, block_ids
-        )
-        batch_transfer_d2h_sync(tpu_tensors, cpu_tensors)
-
-    def _wait_stage(self, future: Any) -> None:
-        future.wait()
-
-    def _h2d_into_device(self, src_views: list) -> list[torch.Tensor]:
-        device_shards = [
-            torch.empty(v.shape, dtype=v.dtype, device=self.device) for v in src_views
-        ]
-        batch_transfer_h2d_sync(src_views, device_shards)
-        return device_shards
-
-    def _h2d_into_device_async(self, src_views: list) -> tuple[Any, list[torch.Tensor]]:
-        device_shards = [
-            torch.empty(v.shape, dtype=v.dtype, device=self.device) for v in src_views
-        ]
-        future = batch_transfer_h2d(src_views, device_shards)
-        return future, device_shards
-
-    def _synchronize_device(self, tensor: torch.Tensor) -> None:
-        synchronize_tensors(tensor, wait=False)
-
-    def _try_fast_scatter(
-        self,
-        device_shards: list[torch.Tensor],
-        kv_caches: list[torch.Tensor],
-        local_blocks: list[int],
-    ) -> list[torch.Tensor] | None:
-        if not self._kv_scatter_enabled:
-            return None
-        dest_blocks_dev = torch.tensor(
-            local_blocks, dtype=torch.int32, device=self.device
-        )
-        assert self.device is not None
-        prebuilt = kv_scatter.prepare_scatter_args(dest_blocks_dev, self.device)
-        return kv_scatter.multi_layer_scatter_into(
-            device_shards, kv_caches, dest_blocks_dev, prebuilt_args=prebuilt
-        )
-
-    def _maybe_enable_kv_scatter(self) -> None:
-        """Run the startup smoke test for the multi-layer scatter kernel
-        (``kv_scatter``) and flip it on if it passes. Consumer-only. On
-        by default; any failure falls back permanently to ``index_put_``
-        with a warning. Smoke-tests with a small num_layers; compile for
-        the real per-worker num_layers happens on first invocation
-        (typically during warmup)."""
-        if self.is_producer:
-            return
-        if not kv_scatter.scatter_available():
-            logger.warning(
-                "TPUConnectorWorker %s rank%d --> kv_scatter kernel "
-                "unavailable; staying on index_put_",
-                self.node_id,
-                self.tp_rank,
-            )
-            return
-        trailing = tuple(self.shape[1:]) if len(self.shape) > 1 else (128,)
-        assert self.device is not None
-        ok = kv_scatter.smoke_test_multi_layer_scatter(
-            device=self.device,
-            num_layers=2,
-            num_blocks=4,
-            trailing_shape=trailing,
-            dtype=self.dtype,
-        )
-        if ok:
-            self._kv_scatter_enabled = True
-            logger.info(
-                "TPUConnectorWorker %s rank%d --> multi-layer scatter "
-                "enabled for insert path",
-                self.node_id,
-                self.tp_rank,
-            )
-        else:
-            logger.warning(
-                "TPUConnectorWorker %s rank%d --> multi-layer scatter "
-                "smoke test failed; falling back to index_put_",
-                self.node_id,
-                self.tp_rank,
-            )
 
 
 class TPURaidenConnectorScheduler(TPUConnectorScheduler):

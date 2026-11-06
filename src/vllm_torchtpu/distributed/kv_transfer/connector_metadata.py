@@ -14,9 +14,8 @@
 """Scheduler->worker metadata contract shared by the TPU KV connectors.
 
 These dataclasses are the connector-neutral request bookkeeping (what to
-send, what to load) attached to scheduler output. They are used by both the
-zmq/shm transport stack (zmq_shm_base) and the Raiden connector, so they
-live here rather than inside either transport module.
+send, what to load) attached to scheduler output by the TPU connector
+schedulers and consumed by the Raiden connector worker.
 """
 
 from dataclasses import dataclass, field

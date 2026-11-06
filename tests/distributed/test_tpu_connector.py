@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Unit tests for TPUConnector, TPUConnectorScheduler, and TPUConnectorWorker.
+Unit tests for TPUConnector, TPUConnectorScheduler, and the Raiden connector.
 
-Structure mirrors tests/distributed/test_tpu_connector.py in the upstream
-tpu-inference repo, adapted for the torch-based coordinator-mode connector
-used here.  Heavy dependencies (ZMQ sockets, shared-memory pool, TPU device
+Heavy dependencies (Raiden transfer engine, controller facades, TPU device
 queries) are mocked at construction time so that all tests run without a real
 TPU.
 """
@@ -64,14 +62,11 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     TPUConnector,
     TPUConnectorMetadata,
     TPUConnectorScheduler,
-    TPUConnectorWorker,
     TPURaidenConnector,
     TPURaidenConnectorScheduler,
     TPURaidenConnectorWorker,
     _KV_PARAMS_ADMITTED,
     _KV_PARAMS_REJECTED,
-    _CoordRecvEntry,
-    _CoordSendEntry,
     _Stage3LoadMeta,
     _Stage3RegisteredSend,
     _Stage3TransferGroup,
@@ -86,7 +81,6 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
 # ---------------------------------------------------------------------------
 
 _MOD = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
-_BASE = "vllm_torchtpu.distributed.kv_transfer.zmq_shm_base"
 # Drops a key from a kv_transfer_params fixture.
 _MISSING = object()
 
@@ -341,37 +335,6 @@ def _make_raiden_scheduler(
         return TPURaidenConnectorScheduler(cfg)
 
 
-def _make_worker(
-    *,
-    tp_rank: int = 0,
-    tp_size: int = 1,
-    is_producer: bool = True,
-    dp_rank: int = 0,
-    kv_ips: Any = "127.0.0.1",
-    kv_ports: Any = 9100,
-) -> TPUConnectorWorker:
-    """Construct a TPUConnectorWorker with all I/O and device calls mocked.
-
-    Patches are applied only during __init__; the returned object has real
-    Python state (locks, queues, dicts) but no live ZMQ or TPU handles.
-    register_runner() is intentionally NOT called — tests that need it
-    should mock _coord_setup and call it separately.
-    """
-    cfg = _make_vllm_config(is_producer=is_producer, dp_rank=dp_rank)
-    with (
-        patch(f"{_BASE}.get_tensor_model_parallel_rank", return_value=tp_rank),
-        patch(f"{_BASE}.get_tensor_model_parallel_world_size", return_value=tp_size),
-        patch(f"{_BASE}.dist_utils.get_node_id", return_value=0),
-        patch(f"{_BASE}.dist_utils.get_host_ip", return_value=kv_ips),
-        patch(f"{_BASE}.dist_utils.get_kv_transfer_port", return_value=kv_ports),
-        patch(f"{_BASE}.dist_utils.get_side_channel_port", return_value="9600"),
-        patch(f"{_BASE}.dist_utils.get_transfer_channel_number", return_value=0),
-        patch(f"{_BASE}.dist_utils.get_kv_latency_log_interval", return_value=0.0),
-        patch(f"{_BASE}.zmq.Context"),
-    ):
-        return TPUConnectorWorker(cfg)
-
-
 def _make_raiden_worker(
     *,
     tp_rank: int = 1,
@@ -616,6 +579,15 @@ class TestTPUConnector:
         )
         cfg = _make_vllm_config(is_producer=kv_role != "kv_consumer")
         cfg.kv_transfer_config.kv_role = kv_role
+        if connector_cls is TPUConnector and transport != "raiden":
+            # Without Raiden there is no backend left to construct.
+            with pytest.raises(ValueError, match="ZMQ-shm"):
+                connector_cls(
+                    cfg,
+                    KVConnectorRole.SCHEDULER,
+                    _make_stage3_hybrid_kv_cache_config(),
+                )
+            return
         connector = connector_cls(
             cfg, KVConnectorRole.SCHEDULER, _make_stage3_hybrid_kv_cache_config()
         )
@@ -671,11 +643,11 @@ class TestTPUConnector:
 
         assert connector.supports_divergent_local_hybrid_hits is expected
 
-    @patch(f"{_MOD}.TPUConnectorWorker")
-    @patch(f"{_MOD}.TPUConnectorScheduler")
+    @patch(f"{_MOD}.TPURaidenConnectorWorker")
+    @patch(f"{_MOD}.TPURaidenConnectorScheduler")
     def test_init_scheduler_role(self, mock_sched_cls, mock_worker_cls):
         cfg = _make_vllm_config()
-        connector = TPUConnector(
+        connector = TPURaidenConnector(
             cfg, KVConnectorRole.SCHEDULER, _make_test_kv_cache_config()
         )
         mock_sched_cls.assert_called_once_with(cfg)
@@ -683,11 +655,11 @@ class TestTPUConnector:
         assert connector.connector_scheduler is not None
         assert connector.connector_worker is None
 
-    @patch(f"{_MOD}.TPUConnectorWorker")
-    @patch(f"{_MOD}.TPUConnectorScheduler")
+    @patch(f"{_MOD}.TPURaidenConnectorWorker")
+    @patch(f"{_MOD}.TPURaidenConnectorScheduler")
     def test_init_worker_role(self, mock_sched_cls, mock_worker_cls):
         cfg = _make_vllm_config()
-        connector = TPUConnector(
+        connector = TPURaidenConnector(
             cfg, KVConnectorRole.WORKER, _make_test_kv_cache_config()
         )
         mock_worker_cls.assert_called_once_with(cfg)
@@ -695,11 +667,11 @@ class TestTPUConnector:
         assert connector.connector_scheduler is None
         assert connector.connector_worker is not None
 
-    @patch(f"{_MOD}.TPUConnectorWorker")
-    @patch(f"{_MOD}.TPUConnectorScheduler")
+    @patch(f"{_MOD}.TPURaidenConnectorWorker")
+    @patch(f"{_MOD}.TPURaidenConnectorScheduler")
     def test_scheduler_method_delegation(self, mock_sched_cls, mock_worker_cls):
         cfg = _make_vllm_config()
-        connector = TPUConnector(
+        connector = TPURaidenConnector(
             cfg, KVConnectorRole.SCHEDULER, _make_test_kv_cache_config()
         )
         sched = mock_sched_cls.return_value
@@ -721,11 +693,11 @@ class TestTPUConnector:
         connector.get_finished_count()
         sched.get_finished_count.assert_called_once_with()
 
-    @patch(f"{_MOD}.TPUConnectorWorker")
-    @patch(f"{_MOD}.TPUConnectorScheduler")
+    @patch(f"{_MOD}.TPURaidenConnectorWorker")
+    @patch(f"{_MOD}.TPURaidenConnectorScheduler")
     def test_worker_method_delegation(self, mock_sched_cls, mock_worker_cls):
         cfg = _make_vllm_config()
-        connector = TPUConnector(
+        connector = TPURaidenConnector(
             cfg, KVConnectorRole.WORKER, _make_test_kv_cache_config()
         )
         worker = mock_worker_cls.return_value
@@ -746,34 +718,29 @@ class TestTPUConnector:
         connector.get_kv_connector_stats()
         worker.get_kv_connector_stats.assert_called_once_with()
 
+    @pytest.mark.parametrize(
+        "role", [KVConnectorRole.SCHEDULER, KVConnectorRole.WORKER]
+    )
     @patch(f"{_MOD}.TPURaidenConnectorWorker")
     @patch(f"{_MOD}.TPURaidenConnectorScheduler")
-    @patch(f"{_MOD}.TPUConnectorWorker")
-    @patch(f"{_MOD}.TPUConnectorScheduler")
-    def test_init_defaults_to_zmq_backend(
-        self,
-        mock_sched_cls,
-        mock_worker_cls,
-        mock_raiden_sched_cls,
-        mock_raiden_worker_cls,
+    def test_init_without_raiden_is_rejected(
+        self, mock_raiden_sched_cls, mock_raiden_worker_cls, role
     ):
+        """The ZMQ-shm backend is gone: a TPUConnector that selects neither
+        the Raiden Stage-3 transport nor the Raiden connector must fail at
+        construction instead of silently picking a backend."""
         cfg = _make_vllm_config()
-        TPUConnector(cfg, KVConnectorRole.SCHEDULER, _make_test_kv_cache_config())
-        TPUConnector(cfg, KVConnectorRole.WORKER, _make_test_kv_cache_config())
 
-        mock_sched_cls.assert_called_once_with(cfg)
-        mock_worker_cls.assert_called_once_with(cfg)
+        with pytest.raises(ValueError, match="TPU_KV_RESHARD_TRANSPORT=raiden"):
+            TPUConnector(cfg, role, _make_test_kv_cache_config())
+
         mock_raiden_sched_cls.assert_not_called()
         mock_raiden_worker_cls.assert_not_called()
 
     @patch(f"{_MOD}.TPURaidenConnectorWorker")
     @patch(f"{_MOD}.TPURaidenConnectorScheduler")
-    @patch(f"{_MOD}.TPUConnectorWorker")
-    @patch(f"{_MOD}.TPUConnectorScheduler")
     def test_init_uses_raiden_backend_when_flag_enabled(
         self,
-        mock_sched_cls,
-        mock_worker_cls,
         mock_raiden_sched_cls,
         mock_raiden_worker_cls,
     ):
@@ -787,17 +754,11 @@ class TestTPUConnector:
 
         mock_raiden_sched_cls.assert_called_once_with(cfg)
         mock_raiden_worker_cls.assert_called_once_with(cfg)
-        mock_sched_cls.assert_not_called()
-        mock_worker_cls.assert_not_called()
 
     @patch(f"{_MOD}.TPURaidenConnectorWorker")
     @patch(f"{_MOD}.TPURaidenConnectorScheduler")
-    @patch(f"{_MOD}.TPUConnectorWorker")
-    @patch(f"{_MOD}.TPUConnectorScheduler")
     def test_stage3_transport_env_selects_raiden_backend(
         self,
-        mock_sched_cls,
-        mock_worker_cls,
         mock_raiden_sched_cls,
         mock_raiden_worker_cls,
     ):
@@ -809,8 +770,6 @@ class TestTPUConnector:
 
         mock_raiden_sched_cls.assert_called_once_with(cfg)
         mock_raiden_worker_cls.assert_called_once_with(cfg)
-        mock_sched_cls.assert_not_called()
-        mock_worker_cls.assert_not_called()
 
     @patch(f"{_MOD}.TPURaidenConnectorWorker")
     @patch(f"{_MOD}.TPURaidenConnectorScheduler")
@@ -912,12 +871,8 @@ class TestTPUConnector:
 
     @patch(f"{_MOD}.TPURaidenConnectorWorker")
     @patch(f"{_MOD}.TPURaidenConnectorScheduler")
-    @patch(f"{_MOD}.TPUConnectorWorker")
-    @patch(f"{_MOD}.TPUConnectorScheduler")
     def test_explicit_raiden_connector_forces_raiden_backend(
         self,
-        mock_sched_cls,
-        mock_worker_cls,
         mock_raiden_sched_cls,
         mock_raiden_worker_cls,
     ):
@@ -928,8 +883,6 @@ class TestTPUConnector:
 
         mock_raiden_sched_cls.assert_called_once_with(cfg)
         mock_raiden_worker_cls.assert_called_once_with(cfg)
-        mock_sched_cls.assert_not_called()
-        mock_worker_cls.assert_not_called()
 
     @patch(f"{_MOD}.TPURaidenConnectorWorker")
     @patch(f"{_MOD}.TPURaidenConnectorScheduler")
@@ -948,16 +901,16 @@ class TestTPUConnector:
         assert mock_worker_cls.return_value.named_kv_caches is named
         mock_sched_cls.assert_not_called()
 
-    @patch(f"{_MOD}.TPUConnectorWorker")
-    @patch(f"{_MOD}.TPUConnectorScheduler")
+    @patch(f"{_MOD}.TPURaidenConnectorWorker")
+    @patch(f"{_MOD}.TPURaidenConnectorScheduler")
     def test_request_finished_all_groups_routes_to_flat_in_non_hma(
         self, mock_sched_cls, mock_worker_cls
     ):
         """vLLM routes every SupportsHMA connector through
-        request_finished_all_groups. The default (non-HMA) connector must
+        request_finished_all_groups. Outside Stage-3 the connector must
         translate the single-group tuple back to the flat request_finished."""
         cfg = _make_vllm_config()
-        connector = TPUConnector(
+        connector = TPURaidenConnector(
             cfg, KVConnectorRole.SCHEDULER, _make_test_kv_cache_config()
         )
         sched = mock_sched_cls.return_value
@@ -5887,353 +5840,6 @@ class TestTPURaidenConnectorWorker:
             assert worker._legacy_submitted_loads == {"req3", "req4"}
 
 
-# ---------------------------------------------------------------------------
-# TestTPUConnectorWorkerInit — construction-time state
-# ---------------------------------------------------------------------------
-
-
-class TestTPUConnectorWorkerInit:
-    """Verify the coordinator state set up by __init__ / _init_coord_state.
-
-    register_runner() is not called; all shm/ZMQ/thread bringup is skipped.
-    """
-
-    def test_tp1_coord_workers_ready_is_set_eagerly(self):
-        # With a single rank there are no peers to wait for.
-        worker = _make_worker(tp_rank=0, tp_size=1)
-        assert worker._coord_workers_ready.is_set()
-
-    def test_tp2_coord_workers_ready_not_yet_set(self):
-        worker = _make_worker(tp_rank=0, tp_size=2)
-        assert not worker._coord_workers_ready.is_set()
-
-    def test_n_channels_auto_equals_tp_size(self):
-        # get_transfer_channel_number returns 0 → auto → n_channels == tp_size
-        worker = _make_worker(tp_rank=0, tp_size=4)
-        assert worker._n_channels == 4
-
-    def test_n_channels_override_clamped_to_tp_size(self):
-        # Requesting 16 channels on a TP=4 worker is clamped to 4.
-        with (
-            patch(f"{_BASE}.get_tensor_model_parallel_rank", return_value=0),
-            patch(f"{_BASE}.get_tensor_model_parallel_world_size", return_value=4),
-            patch(f"{_BASE}.dist_utils.get_node_id", return_value=0),
-            patch(f"{_BASE}.dist_utils.get_host_ip", return_value="127.0.0.1"),
-            patch(f"{_BASE}.dist_utils.get_kv_transfer_port", return_value="9100"),
-            patch(f"{_BASE}.dist_utils.get_side_channel_port", return_value="9600"),
-            patch(f"{_BASE}.dist_utils.get_transfer_channel_number", return_value=16),
-            patch(f"{_BASE}.dist_utils.get_kv_latency_log_interval", return_value=0.0),
-            patch(f"{_BASE}.zmq.Context"),
-        ):
-            worker = TPUConnectorWorker(_make_vllm_config())
-        assert worker._n_channels == 4
-
-    def test_kv_scatter_disabled_until_smoke_test(self):
-        # Scatter is only enabled after register_runner runs the smoke test.
-        worker = _make_worker()
-        assert not worker._kv_scatter_enabled
-
-    def test_kv_transfer_ports_span_n_channels(self):
-        worker = _make_worker(tp_rank=0, tp_size=3)
-        base = int(worker.kv_transfer_port)
-        assert worker._kv_transfer_ports == [base, base + 1, base + 2]
-
-    def test_dp_port_configurations(self):
-        worker = _make_worker(dp_rank=0, tp_size=1)
-        assert worker.kv_transfer_port == 9100
-        assert worker.side_channel_port == 9600
-
-        worker = _make_worker(dp_rank=1, tp_size=1)
-        assert worker.kv_transfer_port == 9101
-        assert worker.side_channel_port == 9601
-
-        worker = _make_worker(dp_rank=0, tp_size=4)
-        assert worker.kv_transfer_port == 9100
-        assert worker.side_channel_port == 9600
-
-        worker = _make_worker(dp_rank=1, tp_size=4)
-        assert worker.kv_transfer_port == 9104
-        assert worker.side_channel_port == 9601
-
-
-# ---------------------------------------------------------------------------
-# TestKVCacheReplacement — runner / forward-context consistency
-# ---------------------------------------------------------------------------
-
-
-class TestKVCacheReplacement:
-    def test_replace_runner_kv_cache_updates_bound_attention_layers(self):
-        worker = _make_worker(tp_rank=0, tp_size=1, is_producer=False)
-
-        old_cache0 = torch.empty(1)
-        old_cache1 = torch.empty(1)
-        new_cache0 = torch.ones(1)
-
-        runner = MagicMock()
-        runner.kv_caches = [old_cache0, old_cache0, old_cache1]
-        worker.runner = runner
-
-        layer0 = MagicMock()
-        layer0.kv_cache = old_cache0
-        shared_layer0 = MagicMock()
-        shared_layer0.kv_cache = old_cache0
-        layer1 = MagicMock()
-        layer1.kv_cache = old_cache1
-        worker.vllm_config.compilation_config.static_forward_context = {
-            "layer.0": layer0,
-            "layer.0.shared": shared_layer0,
-            "layer.1": layer1,
-            "non_attention": object(),
-        }
-
-        worker._replace_runner_kv_cache(0, new_cache0)
-
-        assert runner.kv_caches[0] is new_cache0
-        assert runner.kv_caches[1] is new_cache0
-        assert layer0.kv_cache is new_cache0
-        assert shared_layer0.kv_cache is new_cache0
-        assert runner.kv_caches[2] is old_cache1
-        assert layer1.kv_cache is old_cache1
-
-
-# ---------------------------------------------------------------------------
-# TestResolveRemoteHostPort — multi-host routing helper
-# ---------------------------------------------------------------------------
-
-
-class TestResolveRemoteHostPort:
-    """_resolve_remote_host_port picks the right host/port for this node_id."""
-
-    def setup_method(self):
-        self.worker = _make_worker(tp_rank=0, tp_size=1)
-
-    def test_single_host_passthrough(self):
-        meta = LoadMeta(
-            uuid=1,
-            local_block_ids=[0],
-            remote_block_ids=[0],
-            remote_host="1.2.3.4",
-            remote_port=9100,
-        )
-        host, port, side_channel_port = self.worker._resolve_remote_host_port(meta)
-        assert host == "1.2.3.4"
-        assert port == 9100
-        assert side_channel_port is None
-
-    def test_multi_host_selects_node_id_entry(self):
-        # node_id=0 (set in _make_worker) → picks index 0
-        meta = LoadMeta(
-            uuid=2,
-            local_block_ids=[0],
-            remote_block_ids=[0],
-            remote_host=["10.0.0.1", "10.0.0.2"],
-            remote_port=[9100, 9101],
-        )
-        host, port, side_channel_port = self.worker._resolve_remote_host_port(meta)
-        assert host == "10.0.0.1"
-        assert port == 9100
-        assert side_channel_port is None
-
-    def test_multi_host_side_channel_port(self):
-        meta = LoadMeta(
-            uuid=3,
-            local_block_ids=[0],
-            remote_block_ids=[0],
-            remote_host=["10.0.0.1", "10.0.0.2"],
-            remote_port=[9100, 9101],
-            remote_side_channel_port=9200,
-        )
-        host, port, side_channel_port = self.worker._resolve_remote_host_port(meta)
-        assert host == "10.0.0.1"
-        assert port == 9100
-        assert side_channel_port == 9200
-
-
-# ---------------------------------------------------------------------------
-# TestCoordGetFinished — _coord_get_finished state-machine tests
-# ---------------------------------------------------------------------------
-
-
-class TestCoordGetFinished:
-    """Directly inject coordinator state and verify the returned finished sets.
-
-    These tests cover the six state transitions in _coord_get_finished without
-    needing a running ZMQ socket, shm pool, or real TPU.
-    """
-
-    def setup_method(self):
-        self.worker = _make_worker(tp_rank=0, tp_size=1, is_producer=True)
-        # _coord_pool is None until register_runner; mock it so release_slot
-        # calls don't crash.
-        self.worker._coord_pool = MagicMock()
-
-    # ---- non-zero rank short-circuit ---------------------------------------
-
-    def test_non_zero_rank_returns_empty_sets(self):
-        worker = _make_worker(tp_rank=1, tp_size=2)
-        done_sending, done_recving = worker._coord_get_finished()
-        assert done_sending == set()
-        assert done_recving == set()
-
-    # ---- producer / done_sending -------------------------------------------
-
-    def test_pull_acked_entry_moves_to_done_sending(self):
-        entry = _CoordSendEntry(
-            req_id="req-acked",
-            slot_idx=0,
-            num_blocks=4,
-            expiration_time=1e9,
-            pull_acked=True,
-        )
-        self.worker._coord_send[10] = entry
-
-        done_sending, done_recving = self.worker._coord_get_finished()
-
-        assert done_sending == {"req-acked"}
-        assert done_recving == set()
-        assert 10 not in self.worker._coord_send
-        self.worker._coord_pool.release_slot.assert_called_once_with(0)
-
-    def test_unacked_entry_stays_in_coord_send(self):
-        entry = _CoordSendEntry(
-            req_id="req-pending",
-            slot_idx=1,
-            num_blocks=4,
-            expiration_time=1e9,
-            pull_acked=False,
-        )
-        self.worker._coord_send[20] = entry
-
-        done_sending, _ = self.worker._coord_get_finished()
-
-        assert done_sending == set()
-        assert 20 in self.worker._coord_send
-        self.worker._coord_pool.release_slot.assert_not_called()
-
-    def test_expiry_sweep_results_drained_once(self):
-        """Entries written by the expiration-sweeper thread are merged in and
-        cleared so they aren't double-reported on the next tick."""
-        self.worker._coord_done_sending = {"swept-req"}
-
-        done_sending, _ = self.worker._coord_get_finished()
-
-        assert done_sending == {"swept-req"}
-        assert len(self.worker._coord_done_sending) == 0
-
-    # ---- consumer / done_recving -------------------------------------------
-
-    def test_load_complete_pull_ok_moves_to_done_recving(self):
-        ev = threading.Event()
-        ev.set()
-        entry = _CoordRecvEntry(
-            req_id="req-pulled",
-            uuid=55,
-            slot_idx=2,
-            num_blocks=4,
-            local_blocks=[0, 1, 2, 3],
-            remote_blocks=[10, 11, 12, 13],
-            remote_host="1.2.3.4",
-            remote_port=9100,
-            load_complete=ev,
-            pull_ok=True,
-            reported_done=False,
-        )
-        self.worker._coord_recv[55] = entry
-
-        _, done_recving = self.worker._coord_get_finished()
-
-        assert done_recving == {"req-pulled"}
-        assert entry.reported_done is True
-
-    def test_incomplete_pull_not_reported(self):
-        ev = threading.Event()  # not set
-        entry = _CoordRecvEntry(
-            req_id="req-in-flight",
-            uuid=56,
-            slot_idx=3,
-            num_blocks=4,
-            local_blocks=[],
-            remote_blocks=[],
-            remote_host="1.2.3.4",
-            remote_port=9100,
-            load_complete=ev,
-            pull_ok=False,
-            reported_done=False,
-        )
-        self.worker._coord_recv[56] = entry
-
-        _, done_recving = self.worker._coord_get_finished()
-
-        assert done_recving == set()
-        assert not entry.reported_done
-
-    def test_reported_done_prevents_duplicate_reporting(self):
-        ev = threading.Event()
-        ev.set()
-        entry = _CoordRecvEntry(
-            req_id="req-already-reported",
-            uuid=57,
-            slot_idx=4,
-            num_blocks=4,
-            local_blocks=[],
-            remote_blocks=[],
-            remote_host="1.2.3.4",
-            remote_port=9100,
-            load_complete=ev,
-            pull_ok=True,
-            reported_done=True,
-        )  # already reported on a prior tick
-        self.worker._coord_recv[57] = entry
-
-        _, done_recving = self.worker._coord_get_finished()
-
-        assert done_recving == set()
-
-    def test_failure_recving_surfaced_and_cleared(self):
-        """Requests in _coord_done_recving (pool exhausted / pull failed) are
-        surfaced exactly once so the scheduler doesn't hang waiting for them."""
-        self.worker._coord_done_recving = {"failed-req"}
-
-        _, done_recving = self.worker._coord_get_finished()
-
-        assert done_recving == {"failed-req"}
-        assert len(self.worker._coord_done_recving) == 0
-
-    # ---- combined tick -----------------------------------------------------
-
-    def test_send_and_recv_reported_in_same_tick(self):
-        entry_send = _CoordSendEntry(
-            req_id="sending-req",
-            slot_idx=5,
-            num_blocks=2,
-            expiration_time=1e9,
-            pull_acked=True,
-        )
-        self.worker._coord_send[100] = entry_send
-
-        ev = threading.Event()
-        ev.set()
-        entry_recv = _CoordRecvEntry(
-            req_id="recving-req",
-            uuid=101,
-            slot_idx=6,
-            num_blocks=2,
-            local_blocks=[0, 1],
-            remote_blocks=[10, 11],
-            remote_host="1.2.3.4",
-            remote_port=9100,
-            load_complete=ev,
-            pull_ok=True,
-            reported_done=False,
-        )
-        self.worker._coord_recv[101] = entry_recv
-
-        done_sending, done_recving = self.worker._coord_get_finished()
-
-        assert done_sending == {"sending-req"}
-        assert done_recving == {"recving-req"}
-
-
 class TestTPUConnectorStats(unittest.TestCase):
     def setUp(self):
         self.registry = CollectorRegistry()
@@ -6432,26 +6038,6 @@ class TestTPUConnectorStats(unittest.TestCase):
         decode_gauge = self.metrics.gauge_tpu_decode_queue_length[0]
         assert prefill_gauge._value.get() == 4.0
         assert decode_gauge._value.get() == 2.0
-
-    def test_worker_in_flight_queue_length_stats(self):
-        worker = MagicMock()
-        worker._is_host_coordinator = True
-        worker.is_producer = False
-        worker._coord_recv = {"uuid1": MagicMock(), "uuid2": MagicMock()}
-        worker._coord_lock = MagicMock()
-        worker.transfer_stats = TpuKVConnectorStats()
-
-        stats = TPUConnectorWorker.get_kv_connector_stats(worker)
-        assert stats is not None
-        assert stats.data["decode_queue_length"] == [2]
-
-        worker.is_producer = True
-        worker._coord_send = {"uuid1": MagicMock()}
-        worker.transfer_stats = TpuKVConnectorStats()
-
-        stats = TPUConnectorWorker.get_kv_connector_stats(worker)
-        assert stats is not None
-        assert stats.data["prefill_queue_length"] == [1]
 
     def test_tpu_connector_stats_constants(self):
         assert METRIC_TYPE_HISTOGRAM == "histogram"

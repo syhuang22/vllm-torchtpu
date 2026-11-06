@@ -103,9 +103,9 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_RAIDEN_ENGINE_ID` | `"0"` | Engine replica identifier for Raiden KV transfer. |
 | `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of parallel DMA transfer streams in `TpuRaidenConnector`. |
 | `TPU_RAIDEN_RESHARD_IMPL` | `"controller"` | Selects `"controller"` or `"host"` KV cache resharding when Prefill and Decode topologies differ. |
-| `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | Transport protocol (`"zmq"` or `"tcp"`) for host-side KV resharding. |
-| `TPU_KV_TRANSFER_PORT` | `"9100"` | Port used by `TPUConnector` for KV cache transfer. |
-| `TPU_SIDE_CHANNEL_PORT` | `"9600"` | Port used by `TPUConnector` for side-channel handshake metadata. |
+| `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | `"raiden"` enables the controller-planned Raiden Stage-3 reshard path (required for `TPUConnector`); `"zmq"` only keeps the legacy non-Stage-3 Raiden path. |
+| `TPU_KV_TRANSFER_PORT` | `"9100"` | Base port for the Raiden connector KV transfer control endpoints. |
+| `TPU_SIDE_CHANNEL_PORT` | `"9600"` | Port advertised by the TPU connector scheduler for side-channel metadata. |
 
 ---
 

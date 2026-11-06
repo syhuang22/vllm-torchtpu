@@ -67,31 +67,12 @@ def get_node_id() -> int:
 
 
 def get_transfer_channel_number() -> int:
-    """Parallel TCP stream count for the coord-mode KV wire transfer.
+    """KV transfer port stride per node for Ray multi-host port advertising.
 
-    0 (default) means auto: coord path uses tp_size channels, one per
-    producer rank shard, bound on consecutive ports base..base+tp_size-1.
-    A non-zero override is clamped to tp_size; ranks are round-robined
-    onto channels by ``rank % n_channels``."""
+    0 (default) means auto (tp_size). A non-zero override is clamped to
+    tp_size. ``TPUWorker.get_node_kv_ip_port`` offsets each node's base KV
+    transfer port by ``node_id * n_channels``."""
     return envs.TPU_KV_TRANSFER_CHANNEL_NUMBER
-
-
-def get_kv_coord_executor_max_workers() -> int:
-    """Request-level pull executor size.
-
-    0 means auto. This executor owns one task per active pull request; each
-    task fans out channel work to the bounded channel executor.
-    """
-    return envs.TPU_KV_COORD_EXECUTOR_MAX_WORKERS
-
-
-def get_kv_channel_executor_max_workers() -> int:
-    """Channel-level pull executor size.
-
-    0 means auto. This bounds simultaneous channel recv/unpack tasks across
-    all active pull requests.
-    """
-    return envs.TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS
 
 
 def get_p2p_wait_pull_timeout() -> int:
@@ -165,94 +146,13 @@ def get_stage3_test_registration_delay_s() -> float:
     return max(envs.TPU_RAIDEN_TEST_REGISTRATION_DELAY_S, 0.0)
 
 
-def get_kv_stage_wait_timeout_secs() -> float:
-    """Per-entry deadline for the async-D2H ``future.wait()`` in the stage
-    waiter. ``TransferFuture.wait()`` is unbounded; this caps how long a
-    single hung DMA can hold up subsequent uuids on the same rank. On
-    timeout the entry is marked stage_failed and STAGE_DONE is signaled so
-    the rest of the pipeline keeps moving.
-    """
-    val = envs.TPU_KV_STAGE_WAIT_TIMEOUT_SECS
-    return val if val > 0 else 30.0
-
-
-def get_kv_stage_waiter_pool_size() -> int:
-    """Worker count for the stage waiter pool. 0 = auto (4).
-
-    Sized above 1 so a single hung ``future.wait()`` does not serialize
-    every subsequently-enqueued uuid behind it.
-    """
-    return envs.TPU_KV_STAGE_WAITER_POOL_SIZE
-
-
 def get_kv_shm_pool_gb() -> float:
-    """Total GB budget for the per-host shared-memory KV staging pool.
+    """Per-host GB budget for legacy (non-Stage-3) Raiden host staging slots.
 
-    The slot count is derived at runtime: ``num_slots = max(1, floor(
-    budget_bytes / per_slot_bytes))``. Each slot holds one request's
-    worth of KV data across all TP ranks (~1GB for typical 70B-class
-    models at max_model_len=8192, TP=8)."""
+    The Raiden worker splits it across TP ranks and derives
+    ``num_slots = max(1, floor(per_rank_budget / per_slot_bytes))`` unless
+    ``TPU_RAIDEN_TRANSFER_NUM_SLOTS`` overrides it."""
     return envs.TPU_KV_SHM_POOL_GB
-
-
-def _get_kv_transfer_namespace() -> str:
-    namespace = envs.TPU_KV_TRANSFER_NAMESPACE
-    if not namespace:
-        return ""
-    safe_chars = []
-    for char in namespace:
-        if char.isalnum() or char in ("_", "-"):
-            safe_chars.append(char)
-        else:
-            safe_chars.append("_")
-    return "".join(safe_chars)
-
-
-def get_ipc_socket_path(node_id: int, dp_rank: int = 0) -> str:
-    """Per-host intra-process IPC endpoint used between rank-0 coordinator
-    and the other TP ranks."""
-    # One socket per host id and DP namespace; same-host P/D disaggregation
-    # may also set TPU_KV_TRANSFER_NAMESPACE for independent engines.
-    prefix = envs.TPU_IPC_SOCKET_DIR
-    namespace = _get_kv_transfer_namespace()
-    suffix = f"_{namespace}" if namespace else ""
-    return f"ipc://{prefix}/tpu_conn{suffix}_node{node_id}_{dp_rank}.sock"
-
-
-def get_shm_name(node_id: int, dp_rank: int = 0) -> str:
-    """Name for the per-host SharedMemory block.
-
-    Scoped by host id, DP rank, and optional engine namespace so same-host
-    prefill/decode processes do not attach to each other's staging pool.
-    """
-    namespace = _get_kv_transfer_namespace()
-    suffix = f"_{namespace}" if namespace else ""
-    return f"tpu_conn_kv{suffix}_node{node_id}_{dp_rank}"
-
-
-def get_kv_warmup_enabled() -> bool:
-    """Whether to pre-compile KV gather/scatter XLA executables at startup.
-
-    Without warmup, the first PULL on the consumer side can time out because
-    the producer is blocked compiling index_select / index_put_ for shapes
-    it has never seen before."""
-    return envs.TPU_KV_WARMUP_ENABLED
-
-
-def get_kv_latency_log_interval() -> float:
-    """How often (seconds) to log aggregated KV transfer latency stats.
-    Set to 0 to disable periodic summaries (per-request lines still print)."""
-    return envs.TPU_KV_LATENCY_LOG_INTERVAL
-
-
-def get_kv_pin_shm() -> bool:
-    """Whether to mlock(2) the KV shm pool at startup.
-
-    Off by default. Requires RLIMIT_MEMLOCK >= TPU_KV_SHM_POOL_GB or
-    CAP_IPC_LOCK; failure is logged and the pool stays pageable. The
-    primary motivation is to make `transfer_h2d_batch` from shm closer
-    to the D2H direction's latency by keeping pages resident in RAM."""
-    return envs.TPU_KV_PIN_SHM
 
 
 def get_use_raiden_connector() -> bool:
