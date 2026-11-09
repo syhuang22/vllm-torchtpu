@@ -287,7 +287,6 @@ export TPU_RAIDEN_ADVERTISE_HOST="$HEAD_IP"
 # and decode rank k the same Raiden work-unit id; the reshard coordinator then
 # makes every decode worker a sender and arms no receiver, and every transfer
 # fails ("No transfer chunks found", vllm-torchtpu-dev build 563).
-export TPU_KV_TRANSFER_NAMESPACE=k3-mk-0
 export TPU_LOG_DIR="$LOG_DIR/tpu"
 export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK=0
 export NPROC=2

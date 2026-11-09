@@ -201,8 +201,6 @@ spec:
                   value: "9600"
                 - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
                   value: "disabled"
-                - name: TPU_KV_TRANSFER_NAMESPACE
-                  value: "gke_prefill"
                 - name: TPU_RAIDEN_JOB_NAME
                   value: "prefill"
                 - name: TPU_RAIDEN_ENGINE_ID
@@ -408,8 +406,6 @@ spec:
                   value: "9600"
                 - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
                   value: "disabled"
-                - name: TPU_KV_TRANSFER_NAMESPACE
-                  value: "gke_decode"
                 - name: TPU_RAIDEN_JOB_NAME
                   value: "decode"
                 - name: TPU_RAIDEN_ENGINE_ID

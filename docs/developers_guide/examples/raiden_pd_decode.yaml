@@ -153,8 +153,6 @@ spec:
           value: "decode"
         - name: TPU_RAIDEN_ENGINE_ID
           value: "decode-engine"
-        - name: TPU_KV_TRANSFER_NAMESPACE
-          value: "decode"
         - name: TPU_GDN_CONV_STATE_TILE_PAD
           value: "1"
         - name: XLA_PYTHON_CLIENT_PREALLOCATE

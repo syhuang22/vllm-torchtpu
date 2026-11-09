@@ -566,7 +566,6 @@ configure_role_environment() {
   export TPU_VISIBLE_CHIPS=0,1,2,3,4,5,6,7
   export TPU_CHIPS_PER_HOST_BOUNDS=1,8,1
   unset DEBUG_TPU_LOCAL_RANK_OFFSET
-  export TPU_KV_TRANSFER_NAMESPACE="${namespace}"
   export TPU_RAIDEN_JOB_NAME="${role}"
   export TPU_RAIDEN_ENGINE_ID="${run_id}-${role}-engine"
 

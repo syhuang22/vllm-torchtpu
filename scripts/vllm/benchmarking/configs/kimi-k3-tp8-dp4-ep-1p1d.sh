@@ -86,7 +86,6 @@ export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
 case "${K3_1P1D_ROLE:-}" in
     prefill)
         _kv_role=kv_producer
-        export TPU_KV_TRANSFER_NAMESPACE=k3_prefill
         export TPU_RAIDEN_ENGINE_ID=k3-prefill-engine
         export TPU_RAIDEN_JOB_NAME=prefill
         export TPU_RAIDEN_RESHARD_PORT_BASE=27000
@@ -94,7 +93,6 @@ case "${K3_1P1D_ROLE:-}" in
         ;;
     decode)
         _kv_role=kv_consumer
-        export TPU_KV_TRANSFER_NAMESPACE=k3_decode
         export TPU_RAIDEN_ENGINE_ID=k3-decode-engine
         export TPU_RAIDEN_JOB_NAME=decode
         export TPU_RAIDEN_RESHARD_PORT_BASE=28000

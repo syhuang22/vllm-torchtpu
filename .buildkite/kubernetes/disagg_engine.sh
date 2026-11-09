@@ -71,14 +71,12 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 # Identity and ports, which must differ so the two do not collide.
 case "$role" in
   prefill)
-    export TPU_KV_TRANSFER_NAMESPACE=gke_prefill
     export TPU_RAIDEN_ENGINE_ID=gke-prefill-engine
     export TPU_RAIDEN_JOB_NAME=prefill
     export TPU_RAIDEN_RESHARD_PORT_BASE=27000
     export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100
     ;;
   decode)
-    export TPU_KV_TRANSFER_NAMESPACE=gke_decode
     export TPU_RAIDEN_ENGINE_ID=gke-decode-engine
     export TPU_RAIDEN_JOB_NAME=decode
     export TPU_RAIDEN_RESHARD_PORT_BASE=28000
