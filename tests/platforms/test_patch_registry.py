@@ -246,6 +246,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_qwen2",
         "maybe_patch_qwen3_5_attn_moe_overlap",
         "maybe_patch_qwen3_omni_thinker",
+        "maybe_patch_qwen3_omni_talker",
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
 
