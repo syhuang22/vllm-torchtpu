@@ -37,8 +37,20 @@ from vllm.v1.sample.thinking_budget_state import ThinkingBudgetStateHolder
 from vllm.v1.worker import gpu_model_runner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
-from vllm_torchtpu.layers.adapter.sample import thinking_budget as tb_kernels
+from vllm_torchtpu.layers.adapter.sample import (
+    plain_chunk_sampler,
+    request_slot_table,
+    thinking_budget_tracker,
+)
+from vllm_torchtpu.layers.adapter.sample import (
+    thinking_budget as tb_kernels,
+)
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
+from vllm_torchtpu.layers.adapter.sample.request_slot_table import (
+    RequestSlotTable,
+    broadcast_amax_scatter,
+    seed_slot_rows,
+)
 from vllm_torchtpu.layers.adapter.sample.thinking_budget import (
     COL_IN_THINK,
     COL_THINK_COUNT,
@@ -48,28 +60,26 @@ from vllm_torchtpu.layers.adapter.sample.thinking_budget import (
     StateTuple,
     ThinkingBudgetMarkers,
     _advance_state_tensor,
-    _broadcast_amax_scatter,
     advance_plain_states,
     advance_sequence_state,
     advance_spec_states,
     advance_state,
     compute_kmp_failure,
     compute_sequence_state,
-    force_bonus_logits,
-    force_bonus_tokens,
-    force_spec_target_logits,
-    force_spec_target_tokens,
-    mask_plain_logits,
+    force_logits_rows,
+    force_token_ids,
+    invalidate_forced_drafts,
     override_and_advance_plain,
     prepare_spec_verify_drafts,
     query_forced_token,
-    seed_states,
+    query_forced_tokens,
+    slice_rows_1d,
 )
-from vllm_torchtpu.runner import greedy_top_tokens, min_tokens, thinking_budget
-from vllm_torchtpu.runner.thinking_budget import (
+from vllm_torchtpu.layers.adapter.sample.thinking_budget_tracker import (
     ThinkingBudgetStepState,
     ThinkingBudgetTracker,
 )
+from vllm_torchtpu.runner import greedy_top_tokens, min_tokens
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
 from vllm_torchtpu.structured_decoding.structured_decoding_manager import (
@@ -260,6 +270,7 @@ def _make_sample_runner(
         TPUModelRunner.gather_logprobs,
         TPUModelRunner.maybe_wait_for_kv_save,
         TPUModelRunner.get_finished_kv_transfers,
+        TPUModelRunner._build_kv_connector_output,
     ):
         setattr(runner, fn.__name__, fn.__get__(runner))
     runner.sample_from_logits_func = TPUModelRunner.sample_from_logits.__get__(runner)
@@ -455,9 +466,10 @@ class TestUpstreamParityAndBoundaries:
                 assert slot_ids is not None
                 row_logits = torch.zeros((4, vocab_size), dtype=torch.float32)
                 row_logits[0, base_tok] = 5.0
-                row_logits = mask_plain_logits(
-                    state_table, slot_ids, row_logits, tracker.markers.end_ids
+                forced_ids = query_forced_tokens(
+                    state_table, slot_ids, tracker.markers.end_ids
                 )
+                row_logits, _ = force_logits_rows(row_logits, forced_ids)
                 sel = torch.argmax(row_logits, dim=-1, keepdim=True)
                 state_table = advance_plain_states(
                     state_table, slot_ids, sel, *tracker.markers.kernel_args()
@@ -483,7 +495,7 @@ class TestUpstreamParityAndBoundaries:
             is None
         )
         tracker_disabled = ThinkingBudgetTracker(_reasoning_config([], []), 4)
-        with patch.object(thinking_budget.logger, "warning_once") as warn:
+        with patch.object(thinking_budget_tracker.logger, "warning_once") as warn:
             tracker_disabled.add("plain", SamplingParams(), [1])
             warn.assert_not_called()
             tracker_disabled.add("b0", SamplingParams(thinking_token_budget=2), [1])
@@ -629,7 +641,7 @@ class TestKMPKernelsFuzz:
             st = compute_sequence_state(start_ids if slot % 2 else [1, 2], b, markers)
             scalar_states[slot], seed_slots[i] = st, slot
             seed_vals[i] = torch.tensor(st, dtype=torch.int32)
-        state_table = seed_states(state_table, seed_slots, seed_vals)
+        state_table = seed_slot_rows(state_table, seed_slots, seed_vals)
 
         vocab_sz = max(vocab_pool) + 8
         for _ in range(30):
@@ -654,9 +666,8 @@ class TestKMPKernelsFuzz:
                     expected_out.append(chosen)
                     scalar_states[slot] = advance_state(st, chosen, markers)
 
-            masked_l = mask_plain_logits(
-                state_table, slot_t, plain_logits, markers.end_ids
-            )
+            forced_plain = query_forced_tokens(state_table, slot_t, markers.end_ids)
+            masked_l, _ = force_logits_rows(plain_logits, forced_plain)
             sampled_from_logits = torch.argmax(masked_l, dim=-1, keepdim=True)
             next_tbl_logits = advance_plain_states(
                 state_table, slot_t, sampled_from_logits, *kernel_args
@@ -716,17 +727,18 @@ class TestKMPKernelsFuzz:
             )
             raw_logits = torch.zeros((padded_tokens, vocab_sz), dtype=torch.float32)
             raw_logits[:, 2] = 4.0
-            flogits, eff_l = force_spec_target_logits(raw_logits, draft_t, forced_tgt)
-            ftokens, eff_t = force_spec_target_tokens(
-                torch.full((padded_tokens,), 2, dtype=torch.int64),
-                draft_t,
-                forced_tgt,
+            flogits, did_f_l = force_logits_rows(raw_logits, forced_tgt)
+            eff_l = invalidate_forced_drafts(draft_t, forced_tgt, did_f_l)
+            ftokens, did_f_t = force_token_ids(
+                torch.full((padded_tokens,), 2, dtype=torch.int64), forced_tgt
             )
+            eff_t = invalidate_forced_drafts(draft_t, forced_tgt, did_f_t)
             raw_bonus_logits = torch.zeros((4, vocab_sz), dtype=torch.float32)
             raw_bonus_logits[:, 3] = 4.0
-            fbonus_l = force_bonus_logits(raw_bonus_logits, forced_bonus)
-            fbonus_t = force_bonus_tokens(
-                torch.full((4,), 3, dtype=torch.int64), forced_bonus
+            forced_bonus_4 = slice_rows_1d(forced_bonus, 4)
+            fbonus_l, _ = force_logits_rows(raw_bonus_logits, forced_bonus_4)
+            fbonus_t, _ = force_token_ids(
+                torch.full((4,), 3, dtype=torch.int64), forced_bonus_4
             )
             assert eff_l.tolist() == exp_eff.tolist() == eff_t.tolist()
             assert torch.argmax(flogits, dim=-1).tolist() == ftokens.tolist()
@@ -788,11 +800,9 @@ class TestKMPKernelsFuzz:
             # Row 1: already -inf (e.g. disallowed by grammar/min_tokens) -> untouched.
             logits[1, GEMMA4_END[0]] = float("-inf")
             snap = logits.clone()
-            out_l, eff_d = force_spec_target_logits(
-                logits,
-                torch.full((1024,), 77, dtype=torch.int32),
-                forced_tgt,
-            )
+            drafts_1024 = torch.full((1024,), 77, dtype=torch.int32)
+            out_l, did_f = force_logits_rows(logits, forced_tgt)
+            eff_d = invalidate_forced_drafts(drafts_1024, forced_tgt, did_f)
             assert torch.equal(logits, snap) and torch.equal(out_l[2:], snap[2:])
             assert out_l[0, GEMMA4_END[0]].item() == 0.0 and eff_d[0].item() == -1
             assert torch.equal(out_l[1], snap[1]) and eff_d[1].item() == 77
@@ -802,7 +812,7 @@ class TestKMPKernelsFuzz:
         i32_min = torch.iinfo(torch.int32).min
         base = torch.zeros((4, 2), dtype=torch.int32)
         vals = torch.tensor([[i32_min, 7], [9, i32_min]], dtype=torch.int32)
-        scattered = _broadcast_amax_scatter(
+        scattered = broadcast_amax_scatter(
             base,
             torch.tensor([2, 0], dtype=torch.int32),
             vals,
@@ -812,7 +822,7 @@ class TestKMPKernelsFuzz:
         assert scattered[0].tolist() == [0, 0]
 
         with pytest.raises(AssertionError, match="Duplicate active indices"):
-            seed_states(
+            seed_slot_rows(
                 table,
                 torch.tensor([1, 1], dtype=torch.int32),
                 torch.zeros((2, 7), dtype=torch.int32),
@@ -822,12 +832,48 @@ class TestKMPKernelsFuzz:
 class TestLifecyclePreemptionAndChunkedPrefill:
     """Lifecycle hooks, wave slot recycling, H2D reuse, and real ``_update_states``."""
 
+    def test_reusable_request_slot_table_for_stateful_processors(self) -> None:
+        """Verify ``RequestSlotTable`` works independently of KMP state."""
+        pool: RequestSlotTable[tuple[int, int]] = RequestSlotTable(
+            max_num_reqs=2, num_cols=2, sentinel_row=(-99, 0)
+        )
+        assert pool.capacity == 3 and pool.num_cols == 2 and pool.table is None
+        tracked = {"a": (10, 1), "b": (20, 2), "c": (30, 3)}
+        pool.mark_dirty("a", tracked["a"])
+        assert not pool.needs_cold_reseed(["a"], tracked)
+        assert pool.needs_cold_reseed(["b"], tracked)
+
+        cold_calls: list[str] = []
+
+        def cold_row(rid: str) -> tuple[int, int]:
+            cold_calls.append(rid)
+            return tracked[rid]
+
+        tbl = pool.sync_step(torch.device("cpu"), ["a", "b"], tracked, cold_row)
+        assert tbl is not None and cold_calls == ["b"]
+        assert tuple(tbl[0].tolist()) == (-99, 0)
+        sa, sb = pool.slot_for("a"), pool.slot_for("b")
+        assert sa is not None and sb is not None and sa != sb
+        assert tuple(tbl[sa].tolist()) == (10, 1)
+        assert tuple(tbl[sb].tolist()) == (20, 2)
+
+        sl1 = pool.build_chunk_slot_ids(torch.device("cpu"), ["a", "b"], 0, 2)
+        sl2 = pool.build_chunk_slot_ids(torch.device("cpu"), ["a", "b"], 0, 2)
+        assert sl1 is not None and sl2 is sl1 and sl1.tolist() == [sa, sb]
+
+        # Wave swap frees 'a' and cold-reseeds 'c', then cold-reseeds 'a' on return.
+        tbl = pool.sync_step(torch.device("cpu"), ["b", "c"], tracked, cold_row)
+        assert tbl is not None and "a" not in pool.allocated_req_ids()
+        assert cold_calls == ["b", "c"]
+        tbl = pool.sync_step(torch.device("cpu"), ["a", "c"], tracked, cold_row)
+        assert tbl is not None and cold_calls == ["b", "c", "a"]
+
     def test_update_states_lifecycle_slot_reuse_and_batch_reorder(self) -> None:
         cfg = _reasoning_config(list(QWEN3_START), list(QWEN3_END))
         tracker = ThinkingBudgetTracker(cfg, max_num_reqs=2)
         tracker.add("plain", SamplingParams(), [1, QWEN3_START[0]])
         tracker.add("pool", None, [1])
-        assert tracker.enabled and not tracker and tracker._state_table is None
+        assert tracker.enabled and not tracker and tracker.slots.table is None
 
         sp2 = SamplingParams(thinking_token_budget=2)
         reqs = {
@@ -855,7 +901,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         assert s_pad8 is not None and s_pad8 is not s1 and s_pad8.shape == (8,)
         assert s_reord is not None and s_reord.tolist()[:2] == s1.tolist()[:2][::-1]
 
-        with pytest.raises(AssertionError, match="slot pool exhausted"):
+        with pytest.raises(AssertionError, match="RequestSlotTable pool exhausted"):
             tracker.prepare_step(torch.device("cpu"), ["r0", "r1", "r2"], reqs)
         assert (
             tracker.prepare_step(
@@ -863,7 +909,8 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             )
             is not None
         )
-        assert "r0" not in tracker._slot_by_req_id and "r2" in tracker._slot_by_req_id
+        allocated = tracker.slots.allocated_req_ids()
+        assert "r0" not in allocated and "r2" in allocated
 
         # InputBatch swap_states + upstream thinking_budget_state_holder cleanup.
         batch = _make_input_batch(64, reasoning_config=cfg)
@@ -956,22 +1003,20 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             ]
             cached = [rid for rid in wave_ids if rid not in new_ids]
             if cached:
-                resumed = {
+                reentering = {
                     rid
                     for rid in cached
                     if rid not in runner.input_batch.req_id_to_index
                 }
                 so.scheduled_cached_reqs = CachedRequestData(
                     req_ids=cached,
-                    resumed_req_ids=resumed,
+                    resumed_req_ids=set(),
                     new_token_ids=[],
                     all_token_ids={
                         rid: [*prompt, *runner.requests[rid].output_token_ids]
-                        for rid in resumed
+                        for rid in reentering
                     },
-                    new_block_ids=[
-                        ([1],) if rid in resumed else None for rid in cached
-                    ],
+                    new_block_ids=[None] * len(cached),
                     num_computed_tokens=[
                         len(prompt) + len(runner.requests[rid].output_token_ids)
                         for rid in cached
@@ -1004,12 +1049,14 @@ class TestLifecyclePreemptionAndChunkedPrefill:
 
         # Wave 2: evict r0, r1 implicitly (preempted_req_ids=None) & admit r2, r3.
         schedule_wave(["r2", "r3"], ["r2", "r3"])
-        assert set(tracker._slot_by_req_id).isdisjoint({"r0", "r1"})
+        assert set(tracker.slots.allocated_req_ids()).isdisjoint({"r0", "r1"})
         assert decode_wave(["r2", "r3"], [40, 50]) == [GEMMA4_END[0], 50]
 
-        # Wave 3: admit r4 (5th live request!) alongside re-entering r0.
+        # Wave 3: admit r4 (5th live request!) alongside cold-reentering r0.
         schedule_wave(["r4", "r0"], ["r4"])
         assert len(runner.requests) == 5 and len(tracker.requests) == 5
+        assert not tracker.slots.has_dirty("r0")
+        assert tracker.needs_output_reseed(["r4", "r0"])
         # r0 already has [20] (1/2 budget used): next token [21] hits 2/2, then forces!
         assert decode_wave(["r4", "r0"], [60, 21]) == [60, 21]
         assert decode_wave(["r4", "r0"], [61, 22]) == [GEMMA4_END[0], GEMMA4_END[0]]
@@ -1074,7 +1121,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         so_preempt.preempted_req_ids = {"p"} if explicit_preempt else None
         runner._update_states(so_preempt)
         assert "p" not in runner.input_batch.req_id_to_index
-        assert "p" not in tracker._slot_by_req_id
+        assert "p" not in tracker.slots.allocated_req_ids()
 
         all_toks = [*prompt, *settled_outputs]
         so_resume = SchedulerOutput.make_empty()
@@ -1138,8 +1185,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             vocab_size=128,
             async_scheduling=True,
         )
-        runner0._thinking_budget._dirty_states.clear()
-        runner0._thinking_budget._slot_by_req_id.clear()
+        runner0._thinking_budget.slots.release(["r0"])
         runner0.input_batch.num_tokens_no_spec[0] = 3
         runner0._pre_async_results = SimpleNamespace(
             req_ids=["r0"],
@@ -1362,6 +1408,46 @@ class TestSampleTokens:
             req_s.num_computed_tokens += 1
         assert emitted_s == [50, 50, GEMMA4_END[0], GEMMA4_END[1]]
 
+    def test_sample_plain_chunk_custom_logits_processors(self) -> None:
+        """Verify ``sample_plain_chunk`` preserves raw logprob_logits and runs
+        ordered logits processors alongside ``ThinkingBudgetStepState``."""
+        cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
+        sp = SamplingParams(temperature=0.0, thinking_token_budget=0)
+        req = _request_state("r0", [1, *GEMMA4_START], sp)
+        tracker = ThinkingBudgetTracker(cfg, max_num_reqs=4)
+        tracker.add("r0", sp, req.prompt_token_ids)
+        tb_step = tracker.step_state(
+            torch.device("cpu"), ["r0"], {"r0": req}, frozenset()
+        )
+        assert tb_step is not None
+
+        raw = torch.zeros((4, 128), dtype=torch.float32)
+        raw[0, 12] = 9.0
+        raw[0, 13] = 5.0
+
+        def block_forced_and_12(lg: torch.Tensor) -> torch.Tensor:
+            out = lg.clone()
+            out[0, GEMMA4_END[0]] = float("-inf")
+            out[0, 12] = float("-inf")
+            return out
+
+        selected, logprob_logits = plain_chunk_sampler.sample_plain_chunk(
+            raw,
+            batch_req_ids=["r0"],
+            cur_start_idx=0,
+            cur_end_idx=1,
+            top_tokens=False,
+            all_greedy=True,
+            sampling_generator=None,
+            sample_stage=nullcontext(),
+            greedy_sample_fn=lambda x: torch.argmax(x, dim=-1, keepdim=True),
+            logits_processors=(block_forced_and_12,),
+            tb_step=tb_step,
+        )
+        assert logprob_logits is raw
+        assert torch.isfinite(logprob_logits).all()
+        assert int(selected[0, 0].item()) == 13
+
     @pytest.mark.parametrize(
         "mode",
         [
@@ -1432,7 +1518,8 @@ class TestSampleTokens:
                 [69],
             ]
             st_tbl = runner._thinking_budget.ensure_state_table(torch.device("cpu"))
-            slot_r2 = runner._thinking_budget._slot_by_req_id["r2"]
+            slot_r2 = runner._thinking_budget.slots.slot_for("r2")
+            assert slot_r2 is not None
             assert int(st_tbl[slot_r2, COL_THINK_COUNT].item()) == 1
         elif mode == "async_eagle3":
             req = _request_state(
@@ -1570,18 +1657,17 @@ class TestPrecompileAndTPU:
                 ),
             ):
                 calls: set[tuple[object, ...]] = set()
-                seen_plain_order: list[int] = []
-                for orig_fn in (
-                    seed_states,
-                    mask_plain_logits,
-                    advance_plain_states,
-                    override_and_advance_plain,
-                    prepare_spec_verify_drafts,
-                    force_spec_target_logits,
-                    force_bonus_logits,
-                    force_spec_target_tokens,
-                    force_bonus_tokens,
-                    advance_spec_states,
+                for mod, orig_fn in (
+                    (request_slot_table, seed_slot_rows),
+                    (tb_kernels, query_forced_tokens),
+                    (tb_kernels, slice_rows_1d),
+                    (tb_kernels, force_logits_rows),
+                    (tb_kernels, force_token_ids),
+                    (tb_kernels, invalidate_forced_drafts),
+                    (tb_kernels, advance_plain_states),
+                    (tb_kernels, override_and_advance_plain),
+                    (tb_kernels, prepare_spec_verify_drafts),
+                    (tb_kernels, advance_spec_states),
                 ):
                     fn_name = orig_fn.__name__
                     compiled_fn = torch.compile(
@@ -1592,8 +1678,6 @@ class TestPrecompileAndTPU:
                     )
 
                     def spy(*args, _name=fn_name, _compiled=compiled_fn):
-                        if _name == "mask_plain_logits":
-                            seen_plain_order.append(int(args[1].shape[0]))
                         sig = tuple(
                             (tuple(a.shape), a.dtype)
                             if isinstance(a, torch.Tensor)
@@ -1603,7 +1687,7 @@ class TestPrecompileAndTPU:
                         calls.add((_name, *sig))
                         return _compiled(*args)
 
-                    monkeypatch.setattr(tb_kernels, fn_name, spy)
+                    monkeypatch.setattr(mod, fn_name, spy)
 
                 cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
                 runner = object.__new__(TPUModelRunner)
@@ -1621,17 +1705,10 @@ class TestPrecompileAndTPU:
                     target_grammar_bitmask_cpu=torch.zeros((64, 1), dtype=torch.int32)
                 )
                 runner._thinking_budget = ThinkingBudgetTracker(cfg, max_num_reqs=64)
-                monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "1")
-                monkeypatch.setenv("LOCAL_RANK", "4")
 
                 runner._precompile_thinking_budget()
-                assert seen_plain_order == [32, 64, 8, 16]
                 precompiled, calls = calls, set()
-                top_only = {
-                    "override_and_advance_plain",
-                    "force_spec_target_tokens",
-                    "force_bonus_tokens",
-                }
+                top_only = {"override_and_advance_plain", "force_token_ids"}
                 seen_names = {c[0] for c in precompiled}
                 if not use_top_tokens:
                     assert seen_names.isdisjoint(top_only)
@@ -1648,9 +1725,7 @@ class TestPrecompileAndTPU:
 
                 step = ThinkingBudgetStepState(tb, st_table, tb.markers, frozenset())
                 for num_reqs in runner.num_reqs_paddings:
-                    slots = step.chunk_slot_ids(
-                        torch.device("cpu"), ["r0"], 0, 1, num_reqs
-                    )
+                    slots = step.chunk_slot_ids(torch.device("cpu"), ["r0"], 0, 1)
                     assert slots is not None
                     step.mask_plain_logits(
                         torch.zeros((num_reqs, 128), dtype=torch.bfloat16), slots
@@ -1673,27 +1748,25 @@ class TestPrecompileAndTPU:
                             num_tokens, num_reqs
                         ):
                             continue
-                        chunk = step.spec_chunk(
-                            torch.device("cpu"), ["r0"], 0, 1, num_reqs
-                        )
+                        chunk = step.spec_chunk(torch.device("cpu"), ["r0"], 0, 1)
                         assert chunk is not None
-                        md = SimpleNamespace(
-                            segment_ids=torch.full((num_tokens,), 1, dtype=torch.int64),
-                            group_indices=torch.zeros(num_tokens, dtype=torch.int32),
-                        )
+                        seg_ids = torch.full((num_tokens,), 1, dtype=torch.int64)
+                        grp_ids = torch.zeros(num_tokens, dtype=torch.int32)
                         chunk.prepare_logits(
-                            torch.zeros(num_tokens, dtype=torch.int32),
                             torch.zeros((num_tokens, 128), dtype=torch.bfloat16),
                             torch.zeros((num_reqs, 128), dtype=torch.bfloat16),
-                            md,  # type: ignore[arg-type]
+                            torch.zeros(num_tokens, dtype=torch.int32),
+                            seg_ids,
+                            grp_ids,
                             3,
                         )
                         if use_top_tokens:
                             chunk.prepare_tokens(
-                                torch.zeros(num_tokens, dtype=torch.int32),
                                 torch.zeros(num_tokens, dtype=torch.int64),
                                 torch.zeros(num_reqs, dtype=torch.int64),
-                                md,  # type: ignore[arg-type]
+                                torch.zeros(num_tokens, dtype=torch.int32),
+                                seg_ids,
+                                grp_ids,
                                 3,
                             )
                         chunk.finish(
@@ -1747,18 +1820,21 @@ class TestPrecompileAndTPU:
         )
         logits_cpu = torch.randn((16, 128), dtype=torch.bfloat16)
         logits_cpu[1, GEMMA4_END[1]] = float("-inf")
-        bonus_logits_cpu = torch.randn((4, 128), dtype=torch.bfloat16)
+        bonus_logits_cpu = torch.randn((2, 128), dtype=torch.bfloat16)
 
         with torch.compiler.set_stance("force_eager"):
             ftgt_cpu, fbon_cpu = prepare_spec_verify_drafts(
                 cpu_tbl, cpu_sl, drafts_cpu, seg_cpu, grp_cpu, 3, *kernel_args
             )
-            fl_cpu, ed_cpu = force_spec_target_logits(logits_cpu, drafts_cpu, ftgt_cpu)
-            fbl_cpu = force_bonus_logits(bonus_logits_cpu, fbon_cpu)
-            ft_cpu, edt_cpu = force_spec_target_tokens(
-                torch.arange(16, dtype=torch.int64), drafts_cpu, ftgt_cpu
+            fl_cpu, df_l_cpu = force_logits_rows(logits_cpu, ftgt_cpu)
+            ed_cpu = invalidate_forced_drafts(drafts_cpu, ftgt_cpu, df_l_cpu)
+            fbon_2_cpu = slice_rows_1d(fbon_cpu, 2)
+            fbl_cpu, _ = force_logits_rows(bonus_logits_cpu, fbon_2_cpu)
+            ft_cpu, df_t_cpu = force_token_ids(
+                torch.arange(16, dtype=torch.int64), ftgt_cpu
             )
-            fbt_cpu = force_bonus_tokens(torch.arange(4, dtype=torch.int64), fbon_cpu)
+            edt_cpu = invalidate_forced_drafts(drafts_cpu, ftgt_cpu, df_t_cpu)
+            fbt_cpu, _ = force_token_ids(torch.arange(2, dtype=torch.int64), fbon_2_cpu)
 
         ftgt_tpu, fbon_tpu = prepare_spec_verify_drafts(
             tpu_tbl,
@@ -1769,17 +1845,16 @@ class TestPrecompileAndTPU:
             3,
             *kernel_args,
         )
-        fl_tpu, ed_tpu = force_spec_target_logits(
-            logits_cpu.to(tpu), drafts_cpu.to(tpu), ftgt_tpu
+        fl_tpu, df_l_tpu = force_logits_rows(logits_cpu.to(tpu), ftgt_tpu)
+        ed_tpu = invalidate_forced_drafts(drafts_cpu.to(tpu), ftgt_tpu, df_l_tpu)
+        fbon_2_tpu = slice_rows_1d(fbon_tpu, 2)
+        fbl_tpu, _ = force_logits_rows(bonus_logits_cpu.to(tpu), fbon_2_tpu)
+        ft_tpu, df_t_tpu = force_token_ids(
+            torch.arange(16, dtype=torch.int64).to(tpu), ftgt_tpu
         )
-        fbl_tpu = force_bonus_logits(bonus_logits_cpu.to(tpu), fbon_tpu)
-        ft_tpu, edt_tpu = force_spec_target_tokens(
-            torch.arange(16, dtype=torch.int64).to(tpu),
-            drafts_cpu.to(tpu),
-            ftgt_tpu,
-        )
-        fbt_tpu = force_bonus_tokens(
-            torch.arange(4, dtype=torch.int64).to(tpu), fbon_tpu
+        edt_tpu = invalidate_forced_drafts(drafts_cpu.to(tpu), ftgt_tpu, df_t_tpu)
+        fbt_tpu, _ = force_token_ids(
+            torch.arange(2, dtype=torch.int64).to(tpu), fbon_2_tpu
         )
         synchronize_tensors([fl_tpu, ed_tpu, fbl_tpu, ft_tpu, edt_tpu, fbt_tpu])
         assert torch.equal(fl_tpu.cpu(), fl_cpu) and torch.equal(ed_tpu.cpu(), ed_cpu)
@@ -1795,9 +1870,8 @@ class TestPrecompileAndTPU:
         sel_cpu = torch.tensor([[40], [41], [42], [43]], dtype=torch.int64)
         with torch.compiler.set_stance("force_eager"):
             cpu_tbl = advance_spec_states(cpu_tbl, cpu_sl, next_cpu, 3, *kernel_args)
-            mpl_cpu = mask_plain_logits(
-                cpu_tbl, cpu_sl, plain_logits_cpu, markers.end_ids
-            )
+            fplain_cpu = query_forced_tokens(cpu_tbl, cpu_sl, markers.end_ids)
+            mpl_cpu, _ = force_logits_rows(plain_logits_cpu, fplain_cpu)
             cpu_tbl_adv = advance_plain_states(cpu_tbl, cpu_sl, sel_cpu, *kernel_args)
             out_p_cpu, cpu_tbl = override_and_advance_plain(
                 cpu_tbl, cpu_sl, sel_cpu, *kernel_args
@@ -1806,9 +1880,8 @@ class TestPrecompileAndTPU:
         tpu_tbl = advance_spec_states(
             tpu_tbl, tpu_sl, next_cpu.to(tpu), 3, *kernel_args
         )
-        mpl_tpu = mask_plain_logits(
-            tpu_tbl, tpu_sl, plain_logits_cpu.to(tpu), markers.end_ids
-        )
+        fplain_tpu = query_forced_tokens(tpu_tbl, tpu_sl, markers.end_ids)
+        mpl_tpu, _ = force_logits_rows(plain_logits_cpu.to(tpu), fplain_tpu)
         tpu_tbl_adv = advance_plain_states(
             tpu_tbl, tpu_sl, sel_cpu.to(tpu), *kernel_args
         )

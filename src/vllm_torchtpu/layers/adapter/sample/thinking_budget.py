@@ -28,12 +28,16 @@ from typing import TYPE_CHECKING, Final, cast
 import numpy as np
 import torch
 
+from vllm_torchtpu.layers.adapter.sample.request_slot_table import (
+    broadcast_amax_scatter,
+    scatter_slot_rows,
+)
+
 if TYPE_CHECKING:
     from vllm.config.reasoning import ReasoningConfig
 
 INT32_MAX: Final[int] = 2_147_483_647
 NO_FORCED_TOKEN: Final[int] = -1
-_AMAX_SENTINEL: Final[int] = torch.iinfo(torch.int32).min
 
 # Per-slot int32 columns in ``state_table`` ([capacity, NUM_STATE_COLS]).
 # ``COL_FORCING_END`` is 0 when inactive, 1 while matching an active ``end_ids``
@@ -470,59 +474,49 @@ def _advance_state_tensor(
 
 
 # ---------------------------------------------------------------------------
-# Shared scatter and logits-forcing primitives
+# Compiled TPU kernels: shared forcing primitives, plain decode, & spec verify
 # ---------------------------------------------------------------------------
 
 
-def _broadcast_amax_scatter(
-    base: torch.Tensor,
-    indices: torch.Tensor,
-    values: torch.Tensor,
-    valid: torch.Tensor,
+def _select_slot_states(
+    state_table: torch.Tensor, slot_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    active_slot = slot_ids > 0
+    safe_slots = torch.where(active_slot, slot_ids, torch.zeros_like(slot_ids)).to(
+        torch.int64
+    )
+    return active_slot, torch.index_select(state_table, 0, safe_slots)
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def query_forced_tokens(
+    state_table: torch.Tensor,
+    slot_ids: torch.Tensor,
+    end_ids: tuple[int, ...],
 ) -> torch.Tensor:
-    """Return ``base`` with ``out[indices[i]] = values[i]`` where ``valid[i]``.
-
-    Uses a masked broadcast + ``amax`` reduction (``<= 7 MiB`` at
-    ``max_num_reqs=512``) rather than ``Tensor.scatter(0, ...)``, whose XLA
-    lowering for dynamic colliding indices adds ~7 ms/step on TPU v7x. Active
-    ``indices[valid]`` must be unique within ``[0, base.shape[0])``.
-    """
-    if indices.shape[0] == 0:
-        return base
-    if base.device.type == "cpu" and not torch.compiler.is_compiling():
-        active_idx = indices[valid]
-        assert active_idx.numel() == torch.unique(active_idx).numel(), (
-            "Duplicate active indices passed to _broadcast_amax_scatter"
-        )
-    dest_idx = torch.arange(
-        base.shape[0], dtype=indices.dtype, device=base.device
-    ).unsqueeze(1)
-    match = valid.unsqueeze(0) & (dest_idx == indices.unsqueeze(0))
-    trailing_ones = (1,) * (base.ndim - 1)
-    match_view = match.reshape(*match.shape, *trailing_ones)
-    cand = torch.where(
-        match_view,
-        values.to(base.dtype).unsqueeze(0),
-        _AMAX_SENTINEL,
-    ).amax(dim=1)
-    any_match = match.any(dim=1).reshape(base.shape[0], *trailing_ones)
-    return torch.where(any_match, cand, base)
+    """Query ``[slot_ids.shape[0]]`` forced ``end_ids`` tokens (``-1`` if unforced)."""
+    active_slot, st = _select_slot_states(state_table, slot_ids)
+    no_tok = torch.full_like(slot_ids, NO_FORCED_TOKEN)
+    return torch.where(active_slot, _query_forced_token_tensor(st, end_ids), no_tok)
 
 
-def _scatter_state_rows(
-    state_table: torch.Tensor, slot_ids: torch.Tensor, rows: torch.Tensor
-) -> torch.Tensor:
-    return _broadcast_amax_scatter(state_table, slot_ids, rows, slot_ids > 0)
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def slice_rows_1d(values: torch.Tensor, num_rows: int) -> torch.Tensor:
+    """Slice ``values[:num_rows]`` inside a compiled 1D graph."""
+    return values[:num_rows]
 
 
-def _force_logits_rows_with_mask(
-    logits: torch.Tensor, forced_ids: torch.Tensor
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def force_logits_rows(
+    logits: torch.Tensor,
+    forced_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Mask ``logits`` to one-hot ``0.0`` at ``forced_ids`` when permitted.
 
-    If ``logits[row, forced_id]`` is already ``-inf`` (for example, masked out
-    by structured-output grammar or ``min_tokens``), the row is left unchanged
-    so sampling never emits a disallowed token or produces all-``-inf`` NaNs.
+    Shared across plain decode, speculative bonus logits, and speculative target
+    logits so overlapping ``[rows, vocab_size]`` buckets compile once. If
+    ``logits[row, forced_id]`` is already ``-inf`` (masked out by grammar or
+    ``min_tokens``), the row is left unchanged and ``did_force[row]`` is False.
     """
     safe_ids = forced_ids.clamp(min=0, max=logits.shape[-1] - 1).to(torch.int64)
     orig_forced = logits.gather(-1, safe_ids.unsqueeze(-1))
@@ -532,40 +526,30 @@ def _force_logits_rows_with_mask(
     return masked.scatter(-1, safe_ids.unsqueeze(-1), forced_val), can_force.squeeze(-1)
 
 
-# ---------------------------------------------------------------------------
-# Compiled TPU kernels: seeding and plain decode
-# ---------------------------------------------------------------------------
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def force_token_ids(
+    token_ids: torch.Tensor,
+    forced_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Override 1D greedy ``token_ids`` where ``forced_ids >= 0``."""
+    did_force = forced_ids >= 0
+    forced_out = torch.where(did_force, forced_ids.to(token_ids.dtype), token_ids)
+    return forced_out, did_force
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def seed_states(
-    state_table: torch.Tensor,
-    seed_slots: torch.Tensor,
-    seed_values: torch.Tensor,
+def invalidate_forced_drafts(
+    draft_token_ids: torch.Tensor,
+    forced_target_ids: torch.Tensor,
+    did_force: torch.Tensor,
 ) -> torch.Tensor:
-    """Scatter ``seed_values`` into ``state_table`` at active ``seed_slots``."""
-    return _scatter_state_rows(state_table, seed_slots, seed_values)
-
-
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def mask_plain_logits(
-    state_table: torch.Tensor,
-    slot_ids: torch.Tensor,
-    logits: torch.Tensor,
-    end_ids: tuple[int, ...],
-) -> torch.Tensor:
-    """Mask ``logits`` rows whose slot requires a forced ``end_ids`` token."""
-    active_slot = slot_ids > 0
-    safe_slots = torch.where(active_slot, slot_ids, torch.zeros_like(slot_ids)).to(
-        torch.int64
+    """Invalidate ``draft_token_ids`` (``-1``) where forcing overrode a mismatch."""
+    draft_i32 = draft_token_ids.to(torch.int32)
+    return torch.where(
+        did_force & (draft_i32 != forced_target_ids),
+        torch.full_like(draft_i32, NO_FORCED_TOKEN),
+        draft_i32,
     )
-    st = torch.index_select(state_table, 0, safe_slots)
-    no_tok = torch.full_like(slot_ids, NO_FORCED_TOKEN)
-    forced_ids = torch.where(
-        active_slot, _query_forced_token_tensor(st, end_ids), no_tok
-    )
-    forced_logits, _ = _force_logits_rows_with_mask(logits, forced_ids)
-    return forced_logits
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -580,12 +564,9 @@ def advance_plain_states(
     end_ids: tuple[int, ...],
     end_fail: tuple[int, ...],
 ) -> torch.Tensor:
-    """Advance ``state_table`` for active ``slot_ids`` on ``selected_token_ids``."""
-    active_slot = slot_ids > 0
-    safe_slots = torch.where(active_slot, slot_ids, torch.zeros_like(slot_ids)).to(
-        torch.int64
-    )
-    st = torch.index_select(state_table, 0, safe_slots)
+    """Advance ``state_table`` for ``slot_ids[:selected_token_ids.shape[0]]``."""
+    chunk_slots = slot_ids[: selected_token_ids.shape[0]]
+    _, st = _select_slot_states(state_table, chunk_slots)
     next_st = _advance_state_tensor(
         st,
         selected_token_ids.reshape(-1).to(torch.int32),
@@ -596,7 +577,7 @@ def advance_plain_states(
         end_ids,
         end_fail,
     )
-    return _scatter_state_rows(state_table, slot_ids, next_st)
+    return scatter_slot_rows(state_table, chunk_slots, next_st)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -612,11 +593,8 @@ def override_and_advance_plain(
     end_fail: tuple[int, ...],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Override ``TPU_GREEDY_TOP_TOKENS`` IDs and advance ``state_table``."""
-    active_slot = slot_ids > 0
-    safe_slots = torch.where(active_slot, slot_ids, torch.zeros_like(slot_ids)).to(
-        torch.int64
-    )
-    st = torch.index_select(state_table, 0, safe_slots)
+    chunk_slots = slot_ids[: selected_token_ids.shape[0]]
+    active_slot, st = _select_slot_states(state_table, chunk_slots)
     forced_id = _query_forced_token_tensor(st, end_ids)
     out_tokens = torch.where(
         (active_slot & (forced_id >= 0)).unsqueeze(-1),
@@ -633,12 +611,7 @@ def override_and_advance_plain(
         end_ids,
         end_fail,
     )
-    return out_tokens, _scatter_state_rows(state_table, slot_ids, next_st)
-
-
-# ---------------------------------------------------------------------------
-# Compiled TPU kernels: speculative verification
-# ---------------------------------------------------------------------------
+    return out_tokens, scatter_slot_rows(state_table, chunk_slots, next_st)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -666,11 +639,7 @@ def prepare_spec_verify_drafts(
     (or ``real_num_reqs == max_num_reqs``, outside ``[0, num_reqs)``).
     """
     num_reqs = slot_ids.shape[0]
-    active_slot = slot_ids > 0
-    safe_slots = torch.where(active_slot, slot_ids, torch.zeros_like(slot_ids)).to(
-        torch.int64
-    )
-    st = torch.index_select(state_table, 0, safe_slots)
+    active_slot, st = _select_slot_states(state_table, slot_ids)
     draft_i32 = draft_token_ids.to(torch.int32)
     no_tok = torch.full_like(draft_i32, NO_FORCED_TOKEN)
     no_req_tok = torch.full(
@@ -693,7 +662,7 @@ def prepare_spec_verify_drafts(
             dtype=torch.int32,
             device=state_table.device,
         )
-        draft_grid = _broadcast_amax_scatter(
+        draft_grid = broadcast_amax_scatter(
             empty_cells, flat_idx, draft_i32, in_bounds
         ).reshape(num_reqs, max_draft_tokens)
 
@@ -730,70 +699,6 @@ def prepare_spec_verify_drafts(
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def force_spec_target_logits(
-    target_logits: torch.Tensor,
-    draft_token_ids: torch.Tensor,
-    forced_target_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mask ``target_logits`` and invalidate mismatched ``draft_token_ids``."""
-    forced_logits, did_force = _force_logits_rows_with_mask(
-        target_logits, forced_target_ids
-    )
-    draft_i32 = draft_token_ids.to(torch.int32)
-    effective_draft_ids = torch.where(
-        did_force & (draft_i32 != forced_target_ids),
-        torch.full_like(draft_i32, NO_FORCED_TOKEN),
-        draft_i32,
-    )
-    return forced_logits, effective_draft_ids
-
-
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def force_bonus_logits(
-    bonus_logits: torch.Tensor,
-    forced_bonus_full: torch.Tensor,
-) -> torch.Tensor:
-    """Mask ``bonus_logits`` rows from ``forced_bonus_full`` before sampling."""
-    forced_bonus = forced_bonus_full[: bonus_logits.shape[0]]
-    forced_logits, _ = _force_logits_rows_with_mask(bonus_logits, forced_bonus)
-    return forced_logits
-
-
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def force_spec_target_tokens(
-    target_argmax: torch.Tensor,
-    draft_token_ids: torch.Tensor,
-    forced_target_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Override greedy ``target_argmax`` and invalidate mismatched drafts."""
-    did_force = forced_target_ids >= 0
-    forced_argmax = torch.where(
-        did_force, forced_target_ids.to(target_argmax.dtype), target_argmax
-    )
-    draft_i32 = draft_token_ids.to(torch.int32)
-    effective_draft_ids = torch.where(
-        did_force & (draft_i32 != forced_target_ids),
-        torch.full_like(draft_i32, NO_FORCED_TOKEN),
-        draft_i32,
-    )
-    return forced_argmax, effective_draft_ids
-
-
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def force_bonus_tokens(
-    bonus_token_ids: torch.Tensor,
-    forced_bonus_full: torch.Tensor,
-) -> torch.Tensor:
-    """Override greedy ``bonus_token_ids`` from ``forced_bonus_full``."""
-    forced_bonus = forced_bonus_full[: bonus_token_ids.shape[0]]
-    return torch.where(
-        forced_bonus >= 0,
-        forced_bonus.to(bonus_token_ids.dtype),
-        bonus_token_ids,
-    )
-
-
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def advance_spec_states(
     state_table: torch.Tensor,
     slot_ids: torch.Tensor,
@@ -808,11 +713,7 @@ def advance_spec_states(
 ) -> torch.Tensor:
     """Advance ``state_table`` across accepted/recovered/bonus ``next_tokens``."""
     chunk_slots = slot_ids[: next_tokens.shape[0]]
-    active_slot = chunk_slots > 0
-    safe_slots = torch.where(
-        active_slot, chunk_slots, torch.zeros_like(chunk_slots)
-    ).to(torch.int64)
-    st = torch.index_select(state_table, 0, safe_slots)
+    active_slot, st = _select_slot_states(state_table, chunk_slots)
     for col_idx in range(max_draft_tokens + 1):
         tok = next_tokens[:, col_idx].to(torch.int32)
         valid_col = active_slot & (tok >= 0)
@@ -827,4 +728,4 @@ def advance_spec_states(
             end_fail,
         )
         st = torch.where(valid_col.unsqueeze(-1), next_st, st)
-    return _scatter_state_rows(state_table, chunk_slots, st)
+    return scatter_slot_rows(state_table, chunk_slots, st)
