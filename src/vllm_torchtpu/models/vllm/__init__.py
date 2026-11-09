@@ -29,6 +29,12 @@ _MUSE_SPARK_MODEL = (
     "vllm_torchtpu.models.vllm.muse_spark:MuseSparkForConditionalGeneration"
 )
 _MUSE_SPARK_CAUSAL_MODEL = "vllm_torchtpu.models.vllm.muse_spark:MuseSparkForCausalLM"
+_MUSE_SPARK_DSPARK_MODEL = (
+    "vllm_torchtpu.models.vllm.muse_spark.dspark:MuseSparkDSparkModel"
+)
+_MUSE_SPARK_DFLASH_MODEL = (
+    "vllm_torchtpu.models.vllm.muse_spark.dflash:MuseSparkDFlash2Model"
+)
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -77,5 +83,8 @@ def register_models() -> None:
     register_muse_spark_configs()
     ModelRegistry.register_model("MuseSparkForConditionalGeneration", _MUSE_SPARK_MODEL)
     ModelRegistry.register_model("MuseSparkForCausalLM", _MUSE_SPARK_CAUSAL_MODEL)
+    ModelRegistry.register_model("MuseSparkDSparkModel", _MUSE_SPARK_DSPARK_MODEL)
+    ModelRegistry.register_model("MuseSparkDFlash2Model", _MUSE_SPARK_DFLASH_MODEL)
     MODELS_CONFIG_MAP["MuseSparkForConditionalGeneration"] = TPUMuseSparkConfig
     MODELS_CONFIG_MAP["MuseSparkForCausalLM"] = TPUMuseSparkConfig
+    MODELS_CONFIG_MAP["MuseSparkDSparkModel"] = TPUMuseSparkConfig

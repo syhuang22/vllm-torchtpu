@@ -101,6 +101,7 @@ from .batch_invariant import (
     rms_normalize,
 )
 from .configuration import (
+    MuseSparkConfig,
     MuseSparkDSparkConfig,
     MuseSparkTextConfig,
 )
@@ -201,6 +202,28 @@ class TPUMuseSparkConfig(VerifyAndUpdateConfig):
         if cache_config is not None and not cache_config.user_specified_block_size:
             cache_config.block_size = 128  # type: ignore[assignment]
             cache_config.user_specified_block_size = True
+
+        spec_config = vllm_config.speculative_config
+        if (
+            spec_config is not None
+            and spec_config.method == "dspark"
+            and spec_config.draft_model_config is not None
+        ):
+            draft_cfg = spec_config.draft_model_config
+            hf_cfg = draft_cfg.hf_config
+            target_hf = vllm_config.model_config.hf_config
+            is_muse_target = isinstance(
+                target_hf,
+                (MuseSparkConfig, MuseSparkTextConfig, MuseSparkDSparkConfig),
+            )
+            if hf_cfg is not None and (
+                is_muse_target or isinstance(hf_cfg, MuseSparkDSparkConfig)
+            ):
+                cast(Any, hf_cfg).model_type = "muse_spark_dspark"
+                hf_cfg.architectures = ["MuseSparkDSparkModel"]
+                draft_cfg.quantization = None
+                draft_cfg.quantization_config = None
+                spec_config.update_arch_()
 
 
 class MuseSparkRMSNorm(nn.Module):
