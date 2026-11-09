@@ -18,7 +18,7 @@ through the AR runner here.
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -142,6 +142,78 @@ def test_tpu_ar_model_runner_mixed_dim_mm_slicing():
         ([torch.arange(9, 10, dtype=torch.int64)], torch.ones(1, dtype=torch.bool)),
     )
     assert runner._omni_mm_embeds_list == []
+
+
+def test_tpu_ar_model_runner_capture_model_precompiles_mm_buckets():
+    runner = _build(_stage_config(model_stage="thinker", stage_id=0))
+    runner.device = torch.device("cpu")
+    runner.enforce_eager = False
+    runner.supports_mm_inputs = True
+    runner._pp_is_first = True
+    runner.num_tokens_paddings = [16, 64]
+    runner._update_num_xla_graphs = MagicMock()
+
+    seen_modalities: list[str] = []
+    seen_merges: list[tuple[int, tuple[tuple[int, ...], str] | None]] = []
+    reset_cache = MagicMock()
+    runner.mm_budget = SimpleNamespace(
+        mm_max_toks_per_item={"video": 65536, "audio": 390, "image": 4096},
+        reset_cache=reset_cache,
+    )
+    runner._get_mm_dummy_batch = lambda modality, count: {"modality": modality}
+
+    def _embed_multimodal(**kwargs):
+        modality = kwargs["modality"]
+        seen_modalities.append(modality)
+        width = 8 if modality == "audio" else 32
+        return (torch.ones(4, width),)
+
+    def _embed_input_ids(input_ids, multimodal_embeddings=None, *, is_multimodal=None):
+        mm_info = (
+            None
+            if multimodal_embeddings is None
+            else (
+                tuple(multimodal_embeddings[0].shape),
+                multimodal_embeddings[0].modality,
+            )
+        )
+        seen_merges.append((int(input_ids.shape[0]), mm_info))
+        return torch.zeros(input_ids.shape[0], 8)
+
+    runner.model = SimpleNamespace(
+        embed_multimodal=_embed_multimodal,
+        embed_input_ids=_embed_input_ids,
+    )
+
+    with patch.object(OmniTPUModelRunner, "capture_model") as mock_super_capture:
+        runner.capture_model()
+        mock_super_capture.assert_called_once_with()
+        assert seen_modalities == ["audio", "image"]
+        reset_cache.assert_called_once_with()
+        assert seen_merges == [
+            (16, ((1, 8), "audio")),
+            (64, ((1, 8), "audio")),
+            (16, ((1, 32), "image")),
+            (64, ((1, 32), "image")),
+            (16, None),
+        ]
+
+        # Non-MM, enforce_eager, or non-first PP stage skips MM precompilation
+        for attr in ("supports_mm_inputs", "_pp_is_first"):
+            seen_modalities.clear()
+            seen_merges.clear()
+            setattr(runner, attr, False)
+            runner.capture_model()
+            assert seen_modalities == []
+            assert seen_merges == []
+            setattr(runner, attr, True)
+
+        seen_modalities.clear()
+        seen_merges.clear()
+        runner.enforce_eager = True
+        runner.capture_model()
+        assert seen_modalities == []
+        assert seen_merges == []
 
 
 def test_tpu_ar_model_runner_forward_model_unwraps_omni_output():
