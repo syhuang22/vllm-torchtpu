@@ -74,6 +74,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.custom_ops import muse_moe_tpu
 from vllm_torchtpu.layers.adapter.custom_ops.batch_invariant_ops import (
     det_centered_rms_norm,
@@ -202,6 +203,21 @@ class TPUMuseSparkConfig(VerifyAndUpdateConfig):
         if cache_config is not None and not cache_config.user_specified_block_size:
             cache_config.block_size = 128  # type: ignore[assignment]
             cache_config.user_specified_block_size = True
+
+        if envs.VLLM_TPU_MUSE_MEGAKERNEL:
+            parallel_cfg = vllm_config.parallel_config
+            if parallel_cfg.tensor_parallel_size != 8:
+                raise NotImplementedError(
+                    "VLLM_TPU_MUSE_MEGAKERNEL=1 requires tensor_parallel_size=8 "
+                    f"on TPU, got {parallel_cfg.tensor_parallel_size}."
+                )
+            sched_cfg = vllm_config.scheduler_config
+            if sched_cfg.async_scheduling is not False:
+                logger.info_once(
+                    "VLLM_TPU_MUSE_MEGAKERNEL=1: disabling async_scheduling for "
+                    "synchronous decode slot ownership."
+                )
+                sched_cfg.async_scheduling = False
 
         spec_config = vllm_config.speculative_config
         if (

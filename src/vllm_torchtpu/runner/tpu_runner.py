@@ -239,6 +239,9 @@ class ExecuteModelState:
     # (TPU_GREEDY_TOP_TOKENS).
     top_tokens: bool = False
     kv_save_nan_check: KVSaveNanCheck | None = None
+    # The first `mk_front` requests are megakernel-owned decodes; vLLM's chunks cover
+    # the rest.
+    mk_front: int = 0
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -411,6 +414,76 @@ def _substitute_placeholder_token(
 
 
 logger = init_logger(__name__)
+
+
+def _mk_fastpath_instance() -> Any:
+    if not envs.VLLM_TPU_MUSE_MEGAKERNEL:
+        return None
+    from vllm_torchtpu.models.vllm.muse_spark import megakernel_fastpath
+
+    return megakernel_fastpath.instance()
+
+
+def _megakernel_logprobs(rows: list, k: int) -> LogprobsLists:
+    """vLLM logprob lists from the megakernel's top-k: per generated token `[sampled,
+    top 1..k]` plus the
+    sampled token's 1-based rank."""
+    ids_out, lps_out, ranks, cu = [], [], [], [0]
+    for gen, top_ids, top_lps in rows:
+        for j, tok in enumerate(gen):
+            ids_j = np.asarray(top_ids[j])
+            lps_j = np.asarray(top_lps[j], dtype=np.float32)
+            hit = np.nonzero(ids_j == tok)[0]
+            if hit.size == 0:
+                raise RuntimeError(
+                    f"megakernel sampled token {tok} is not in its own top {ids_j.size}"
+                )
+            ids_out.append(np.concatenate(([tok], ids_j[:k])).astype(np.int32))
+            lps_out.append(
+                np.concatenate(([lps_j[hit[0]]], lps_j[:k])).astype(np.float32)
+            )
+            ranks.append(int(hit[0]) + 1)
+        cu.append(cu[-1] + len(gen))
+    return LogprobsLists(
+        logprob_token_ids=np.stack(ids_out),
+        logprobs=np.stack(lps_out),
+        sampled_token_ranks=np.asarray(ranks, np.int32),
+        cu_num_generated_tokens=cu,
+    )
+
+
+def _megakernel_merge_logprobs(
+    old: Any, rows: list, n_vllm: int, max_num_logprobs: int | None
+) -> Any:
+    """Mixed step: megakernel requests' logprob rows first, then vLLM's, with one `cu`
+    entry per request.
+    """
+    if max_num_logprobs is None and not isinstance(old, LogprobsLists):
+        return old
+    if isinstance(old, LogprobsLists):
+        k = old.logprob_token_ids.shape[1] - 1
+    else:
+        assert max_num_logprobs is not None
+        k = int(max_num_logprobs)
+    mk_lp = _megakernel_logprobs(rows, k)
+    mk_cu = mk_lp.cu_num_generated_tokens
+    assert mk_cu is not None
+    end = mk_cu[-1]
+    if not isinstance(old, LogprobsLists):
+        return mk_lp._replace(cu_num_generated_tokens=list(mk_cu) + [end] * n_vllm)
+    cu_v = old.cu_num_generated_tokens or list(range(n_vllm + 1))
+    cu = list(mk_cu) + [end + c for c in cu_v[1:]]
+    cu += [cu[-1]] * (len(mk_cu) + n_vllm - len(cu))
+    return LogprobsLists(
+        logprob_token_ids=np.concatenate(
+            [mk_lp.logprob_token_ids, old.logprob_token_ids]
+        ),
+        logprobs=np.concatenate([mk_lp.logprobs, old.logprobs]),
+        sampled_token_ranks=np.concatenate(
+            [mk_lp.sampled_token_ranks, old.sampled_token_ranks]
+        ),
+        cu_num_generated_tokens=cu,
+    )
 
 
 def _pp_step[**P, R](
@@ -1858,6 +1931,9 @@ class TPUModelRunner(GPUModelRunner):
         self._init_prefill_checkpoint_units(kv_cache_config)
         with set_current_vllm_config(self.vllm_config):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
+        fastpath = _mk_fastpath_instance()
+        if fastpath is not None:
+            fastpath.bind_runner_state(self)
 
     def _init_prefill_checkpoint_units(self, kv_cache_config: KVCacheConfig) -> None:
         """Initializes the units the worker places prefill checkpoints with.
@@ -2809,6 +2885,9 @@ class TPUModelRunner(GPUModelRunner):
             if slot is not None:
                 self._free_mamba_slots.append(slot)
         self._mamba_offset_seeded.difference_update(invalidated_req_ids)
+        mk_fastpath = _mk_fastpath_instance()
+        if mk_fastpath is not None and invalidated_req_ids:
+            mk_fastpath.release(invalidated_req_ids)
         if self._pre_async_results is not None and invalidated_req_ids:
             # These results belong to freed KV state, including a finished ID
             # resubmitted in this step. Other requests retain their source rows.
@@ -3916,7 +3995,7 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _count_input_chunks(
-        self, scheduler_output: "SchedulerOutput"
+        self, scheduler_output: "SchedulerOutput", start: int = 0
     ) -> tuple[int, int]:
         """Match _prepare_inputs chunking without staging any tensors.
 
@@ -3929,7 +4008,7 @@ class TPUModelRunner(GPUModelRunner):
             return 0, 0
 
         num_reqs = self.input_batch.num_reqs
-        start_index = 0
+        start_index = start
         num_chunks = 0
         max_chunk_reqs = 0
         while start_index < num_reqs:
@@ -4157,6 +4236,9 @@ class TPUModelRunner(GPUModelRunner):
             # included: the rest of the step runs on the trimmed copy.
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
         # Update cached state
+        _mk = _mk_fastpath_instance()
+        if _mk is not None and _mk.timer is not None:
+            _mk.timer.start()
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
@@ -4190,9 +4272,29 @@ class TPUModelRunner(GPUModelRunner):
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output
         )
-        local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
-            scheduler_output
+        mk_fastpath = _mk_fastpath_instance()
+        mk_front = 0
+        if mk_fastpath is not None:
+            mk_fastpath.begin_step()
+            if mk_fastpath.timer is not None:
+                mk_fastpath.timer.mark("update_states_reorder")
+            mk_front, num_decode_reqs, num_windowed_reqs = (
+                mk_fastpath.move_owned_to_front(
+                    self, num_decode_reqs, num_windowed_reqs
+                )
+            )
+        if mk_fastpath is not None and mk_fastpath.timer is not None:
+            mk_fastpath.timer.mark("execute_model_prep")
+        if mk_front and mk_front == self.input_batch.num_reqs:
+            return self._sample_tokens_megakernel(scheduler_output)
+
+        local_num_chunks, local_max_chunk_reqs = (
+            self._count_input_chunks(scheduler_output, mk_front)
+            if mk_front
+            else self._count_input_chunks(scheduler_output)
         )
+        if mk_fastpath is not None:
+            mk_fastpath.begin_step(local_num_chunks)
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
             scheduler_output.total_num_scheduled_tokens,
             local_num_chunks,
@@ -4275,7 +4377,7 @@ class TPUModelRunner(GPUModelRunner):
                     [[0], np.cumsum(is_mm_embed_full.cpu().numpy())]
                 )
 
-        start_index = 0
+        start_index = mk_front
         chunk_index = 0
         logits_list = []
         pooler_output_list = []
@@ -4526,32 +4628,56 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
             else:
-                sample_hidden_states = (
-                    sequence_layout_planner.maybe_select_logits_hidden_states(
-                        hidden_states, layout_plan, logits_indices
+                chunk_all_discard = (
+                    mk_fastpath is not None
+                    and mk_fastpath.ready
+                    and not self.scheduler_config.async_scheduling
+                    and not self.input_batch.logits_processing_needs_token_ids[
+                        : self.input_batch.num_reqs
+                    ].any()
+                    and all(
+                        self.requests[r].num_computed_tokens
+                        + scheduler_output.num_scheduled_tokens[r]
+                        < self.requests[r].num_tokens
+                        for r in self.input_batch.req_ids[
+                            mk_front : self.input_batch.num_reqs
+                        ]
+                        if r is not None
                     )
                 )
-                if sample_hidden_states is None:
+                if chunk_all_discard:
                     hidden_states = sequence_layout_planner.finalize_hidden_states(
                         hidden_states,
                         layout_plan,
                     )
-                    if top_tokens:
-                        logits = self.compute_selected_top_tokens(
-                            hidden_states, logits_indices
+                    logits = torch.empty((0,), device=self.device)
+                else:
+                    sample_hidden_states = (
+                        sequence_layout_planner.maybe_select_logits_hidden_states(
+                            hidden_states, layout_plan, logits_indices
+                        )
+                    )
+                    if sample_hidden_states is None:
+                        hidden_states = sequence_layout_planner.finalize_hidden_states(
+                            hidden_states,
+                            layout_plan,
+                        )
+                        if top_tokens:
+                            logits = self.compute_selected_top_tokens(
+                                hidden_states, logits_indices
+                            )
+                        else:
+                            logits = self.compute_selected_logits(
+                                hidden_states, logits_indices
+                            )
+                    elif top_tokens:
+                        logits = self.compute_top_tokens_from_hidden_states(
+                            sample_hidden_states
                         )
                     else:
-                        logits = self.compute_selected_logits(
-                            hidden_states, logits_indices
+                        logits = self.compute_logits_from_hidden_states(
+                            sample_hidden_states
                         )
-                elif top_tokens:
-                    logits = self.compute_top_tokens_from_hidden_states(
-                        sample_hidden_states
-                    )
-                else:
-                    logits = self.compute_logits_from_hidden_states(
-                        sample_hidden_states
-                    )
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
@@ -4612,9 +4738,20 @@ class TPUModelRunner(GPUModelRunner):
             mamba_state_indices_list=mamba_state_indices_list,
             top_tokens=top_tokens,
             kv_save_nan_check=nan_check,
+            mk_front=mk_front,
         )
 
-        if self.is_pooling_model:
+        if self.is_pooling_model or (
+            mk_fastpath is not None
+            and mk_fastpath.ready
+            and not self.scheduler_config.async_scheduling
+            and not scheduler_output.has_structured_output_requests
+            and not getattr(scheduler_output, "pending_structured_output_tokens", False)
+            and not any(
+                r and r.startswith("__")
+                for r in self.input_batch.req_ids[: self.input_batch.num_reqs]
+            )
+        ):
             return self.sample_tokens(None)
         return None
 
@@ -4716,6 +4853,141 @@ class TPUModelRunner(GPUModelRunner):
         if self.spec_decode_manager is None:
             return None
         return self.spec_decode_manager.take_draft_token_ids()
+
+    def _megakernel_take_ownership(
+        self,
+        scheduler_output: "SchedulerOutput",
+        request_seq_lens: list,
+        discard_indices: list[int],
+        final_output: ModelRunnerOutput,
+    ) -> None:
+        """Requests whose prompt completed this vLLM step move their decode state to the
+        megakernel.
+        """
+        mk_fastpath = _mk_fastpath_instance()
+        if mk_fastpath is None:
+            return
+        sampled: dict[str, tuple[int, int]] = {}
+        discard = set(discard_indices)
+        for i, _req_state, seq_len, req_id in request_seq_lens:
+            if i in discard:
+                continue
+            toks = final_output.sampled_token_ids[i]
+            if toks:
+                sampled[req_id] = (int(toks[0]), int(seq_len))
+        if not sampled:
+            return
+        drafts = None
+        if self.speculative_config is not None:
+            dt = self.spec_decode_manager._draft_token_ids
+            if dt is not None:
+                ids = self.input_batch.req_ids[: self.input_batch.num_reqs]
+                drafts = {rid: list(d) for rid, d in zip(ids, dt) if rid is not None}
+        mk_fastpath.take_ownership(self, scheduler_output, sampled, drafts)
+
+    def _megakernel_check_output(
+        self, out: ModelRunnerOutput, discard: list[int], where: str
+    ) -> None:
+        """Every scheduled, non-discarded request gets at least one token, one list per
+        request.
+        """
+        if _mk_fastpath_instance() is None:
+            return
+        n = self.input_batch.num_reqs
+        if len(out.sampled_token_ids) != n:
+            raise RuntimeError(
+                f"Megakernel {where} step: {len(out.sampled_token_ids)} "
+                f"token lists for {n} requests"
+            )
+        skip = set(discard)
+        empty = [
+            (i, self.input_batch.req_ids[i])
+            for i in range(n)
+            if i not in skip and not out.sampled_token_ids[i]
+        ]
+        if empty:
+            raise RuntimeError(
+                f"Megakernel {where} step: no token for "
+                f"requests {empty} (discard={sorted(skip)})"
+            )
+
+    def _megakernel_prepend_owned(
+        self, final_output: ModelRunnerOutput, mk_front: int
+    ) -> None:
+        """Mixed step: vLLM sampled requests [mk_front, num_reqs); run one megakernel
+        step for the owned front
+        requests and put their tokens, logprobs and drafts ahead of vLLM's."""
+        if mk_front == 0:
+            return
+        mk_fastpath = _mk_fastpath_instance()
+        if mk_fastpath is None:
+            return
+        tm = mk_fastpath.timer
+        if tm is not None:
+            tm.mark("vllm_forward_sample")
+        req_ids = cast(list[str], self.input_batch.req_ids[:mk_front])
+        res = mk_fastpath.run_decode(
+            self, list(range(mk_front)), self._mk_scheduler_output
+        )
+        rows = [(res[r][0], res[r][1], res[r][2]) for r in req_ids]
+        final_output.logprobs = _megakernel_merge_logprobs(
+            final_output.logprobs,
+            rows,
+            len(final_output.sampled_token_ids),
+            self.input_batch.max_num_logprobs,
+        )
+        final_output.sampled_token_ids = [res[r][0] for r in req_ids] + list(
+            final_output.sampled_token_ids
+        )
+        if mk_fastpath.spec:
+            vllm_drafts = self.spec_decode_manager._draft_token_ids or []
+            self.spec_decode_manager._draft_token_ids = [
+                res[r][3] for r in req_ids
+            ] + list(vllm_drafts)
+        if tm is not None:
+            tm.end("mixed")
+
+    def _sample_tokens_megakernel(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> ModelRunnerOutput:
+        """One megakernel decode step for the whole batch, returned as vLLM's model
+        runner output.
+        """
+        mk_fastpath = _mk_fastpath_instance()
+        assert mk_fastpath is not None
+        num_reqs = self.input_batch.num_reqs
+        req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+        res = mk_fastpath.run_decode(self, list(range(num_reqs)), scheduler_output)
+        gen = [res[r][0] for r in req_ids]
+        logprobs: Any = []
+        if self.input_batch.max_num_logprobs is not None:
+            logprobs = _megakernel_logprobs(
+                [(res[r][0], res[r][1], res[r][2]) for r in req_ids],
+                int(self.input_batch.max_num_logprobs),
+            )
+        for b, req_id in enumerate(req_ids):
+            req_state = self.requests[req_id]
+            idx = self.input_batch.req_id_to_index[req_id]
+            start = self.input_batch.num_tokens_no_spec[idx]
+            end = start + len(gen[b])
+            self.input_batch.token_ids_cpu[idx, start:end] = gen[b]
+            self.input_batch.num_tokens_no_spec[idx] = end
+            req_state.output_token_ids.extend(gen[b])
+        if mk_fastpath.spec:
+            self.spec_decode_manager._draft_token_ids = [res[r][3] for r in req_ids]
+        out = ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=dict(self.input_batch.req_id_to_index),
+            sampled_token_ids=gen,
+            logprobs=logprobs,
+            prompt_logprobs_dict={req_id: None for req_id in req_ids},
+            pooler_output=[],
+            kv_connector_output=None,
+        )
+        self._megakernel_check_output(out, [], "mk")
+        if mk_fastpath.timer is not None:
+            mk_fastpath.timer.end("pure")
+        return out
 
     def _get_sampling_generator(self) -> torch.Generator:
         """Return the dedicated non-greedy sampling generator, seeded once.
@@ -5205,13 +5477,15 @@ class TPUModelRunner(GPUModelRunner):
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
+        mk_front = int(getattr(state, "mk_front", 0))
+        mk_active = _mk_fastpath_instance() is not None
         if self.is_pooling_model:
             req_ids = cast(
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
             self._update_num_xla_graphs("pooling_step")
         elif is_spec_step:
-            cur_start_idx = 0
+            cur_start_idx = mk_front
             all_greedy = self.input_batch.all_greedy
             for logits, num_reqs, md, mamba_indices in zip(
                 state.logits_list,
@@ -5335,7 +5609,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._update_num_xla_graphs("spec_step")
                 cur_start_idx = cur_end_idx
         else:
-            cur_start_idx = 0
+            cur_start_idx = mk_front
             req_ids = cast(
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
@@ -5347,6 +5621,9 @@ class TPUModelRunner(GPUModelRunner):
                 # Non-spec step (prefill / plain decode): reset the mamba
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
+                if logits.numel() == 0:
+                    cur_start_idx = cur_end_idx
+                    continue
                 if grammar_output is not None:
                     logits = self.structured_decoding_manager.mask_logits(
                         logits, grammar_output, cur_start_idx, cur_end_idx
@@ -5501,9 +5778,10 @@ class TPUModelRunner(GPUModelRunner):
         # below.
         is_async = bool(self.scheduler_config.async_scheduling)
         eagle3_drafts = None
+        state_draft_chunks = getattr(state, "draft_chunks", None)
         if (
             self._is_async_drafter
-            and combined_selected_tokens
+            and (combined_selected_tokens or state_draft_chunks)
             and not self._is_dspark_pd_producer
         ):
             if is_spec_step:
@@ -5516,6 +5794,26 @@ class TPUModelRunner(GPUModelRunner):
                         return_device=is_async,
                         next_tokens_per_chunk=next_tokens_per_chunk,
                     )
+            elif not combined_selected_tokens:
+                with self._stage_timing.stage("draft_propose"):
+                    if isinstance(getattr(self, "drafter", None), DFlashProposer):
+                        cast(DFlashProposer, self.drafter).prepare_prefill_handoff()
+                        self.spec_decode_manager._draft_token_ids = [
+                            []
+                            for _ in range(max(0, self.input_batch.num_reqs - mk_front))
+                        ]
+                    else:
+                        sdm = self.spec_decode_manager
+                        eagle3_drafts = sdm.propose_draft_token_ids(
+                            sampled_token_ids=[],
+                            discard_sampled_tokens_req_indices=(
+                                discard_sampled_tokens_req_indices
+                            ),
+                            num_rejected_tokens_np=None,
+                            scheduler_output=scheduler_output,
+                            return_device=is_async,
+                            device_seed=None,
+                        )
             else:
                 # Seed = the just-sampled tokens, kept on-device (no D2H):
                 # propose takes the sync seed path but reads the seed from
@@ -5542,6 +5840,10 @@ class TPUModelRunner(GPUModelRunner):
                         # send.
                         flat_seed = handoff_seed_tokens(
                             flat_seed, req_ids, scheduler_output.kv_connector_metadata
+                        )
+                    if mk_front:
+                        flat_seed = torch.cat(
+                            [flat_seed.new_zeros(mk_front), flat_seed]
                         )
                     device_seed = flat_seed
                 with self._stage_timing.stage("draft_propose"):
@@ -5722,11 +6024,25 @@ class TPUModelRunner(GPUModelRunner):
             async_output = AsyncTPUModelRunnerOutput(
                 model_runner_output=model_runner_output,
                 copy_state=copy_state,
-                discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
+                discard_sampled_tokens_req_indices=(
+                    [i - mk_front for i in discard_sampled_tokens_req_indices]
+                    if mk_front
+                    else discard_sampled_tokens_req_indices
+                ),
             )
 
         if not self.scheduler_config.async_scheduling:
             final_output = async_output.get_output()
+            if mk_active:
+                if copy_state is None and not self.is_pooling_model:
+                    final_output.sampled_token_ids = [
+                        [] for _ in range(self.input_batch.num_reqs - mk_front)
+                    ]
+                self._mk_scheduler_output = scheduler_output
+                self._megakernel_prepend_owned(final_output, mk_front)
+                self._megakernel_check_output(
+                    final_output, discard_sampled_tokens_req_indices, "mixed"
+                )
             if not self.is_pooling_model:
                 for i, req_state, seq_len, req_id in request_seq_lens:
                     if i in discard_sampled_tokens_req_indices:
@@ -5757,6 +6073,13 @@ class TPUModelRunner(GPUModelRunner):
                     scheduler_output=scheduler_output,
                 )
 
+            if mk_active:
+                self._megakernel_take_ownership(
+                    scheduler_output,
+                    request_seq_lens,
+                    discard_sampled_tokens_req_indices,
+                    final_output,
+                )
             return final_output
 
         return async_output
@@ -7696,6 +8019,13 @@ class TPUModelRunner(GPUModelRunner):
         """
         if not envs.SPEC_WARMUP:
             return  # escape hatch / A-B toggle
+        mk_fp = _mk_fastpath_instance()
+        if mk_fp is not None and mk_fp.spec:
+            logger.info_once(
+                "skip runner spec-decode warmup: Muse megakernel owns "
+                "speculative decode warmup and verification."
+            )
+            return
         if self.enforce_eager:
             return
         if not (self._is_async_drafter):
@@ -7836,6 +8166,14 @@ class TPUModelRunner(GPUModelRunner):
     def _init_adaptive_verification(self) -> None:
         """Profile the step costs adaptive verification budgets against, then
         warm the trimmed verify steps it can schedule."""
+        mk_fp = _mk_fastpath_instance()
+        if mk_fp is not None and mk_fp.spec:
+            logger.info_once(
+                "Disabling runner adaptive verification: Muse megakernel manages "
+                "speculative verification."
+            )
+            self._adaptive_verification = None
+            return
         manager = self._adaptive_verification
         assert manager is not None
         warmup_plan, max_num_reqs = self._adaptive_verification_warmup_plan()
