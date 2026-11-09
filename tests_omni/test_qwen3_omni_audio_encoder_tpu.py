@@ -21,7 +21,7 @@ reciprocal multiply, so every exact window multiple rounds up (800 / 100 ->
 lengths no longer add up to the input. CPU computes the same expression
 exactly, which is why the CPU unit tests in test_qwen3omni_thinker_patch.py
 cannot see the bug. ``maybe_patch_qwen3_omni_thinker`` moves ``feature_lens``
-to CPU for that computation.
+to CPU and buckets chunk and token counts to static shapes.
 
 The tests build the real encoder with the real chunking geometry (128 mel
 bins, three stride-2 convolutions, 100-frame windows, 800-frame attention
@@ -33,15 +33,16 @@ TPU:
   several 800-frame attention windows; each is checked for the expected
   number of encoder tokens;
 - a mixed batch with two exact multiples;
-- numerical parity with a CPU reference built from the same weights;
-- a canary that fails once TPU computes the ceil exactly, so the patch can be
-  retired.
+- numerical parity with a CPU reference built from the same weights and running
+  the unpatched upstream forward;
+- a canary that fails once TPU computes the ceil exactly, so the CPU
+  ``feature_lens`` hop can be retired.
 """
 
 from __future__ import annotations
 
 from collections.abc import Generator
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import NamedTuple
 
 import portpicker
@@ -83,13 +84,16 @@ pytestmark = [pytest.mark.omni]
 # 3200 adds a length several attention windows (n_window_infer = 800) long.
 BOUNDARY_LENGTHS = [99, 100, 101, 799, 800, 801, 3200]
 MIXED_BATCH = [800, 250, 200, 30]
-# The exact multiple the patch rewrites and one partial-window neighbour.
-PARITY_LENGTHS = [800, 801]
+# 800 frames (8 windows, exact multiple), 801 frames (9 windows, 1-frame tail),
+# 3200 frames (32 windows, upper edge of the 32-window bucket), and 3201 frames
+# (33 windows, crosses past the 32-window bucket into the 40-window fallback).
+PARITY_LENGTHS = [800, 801, 3200, 3201]
 
-# Measured on TPU v6e (bf16 encoder vs the float32 CPU reference, 799-3200
-# frames): relative L2 error 5.9e-3, max abs diff 1.7e-3 on outputs of
-# magnitude ~0.19; batched vs alone identical except the 30-frame sample
-# (5.4e-3 / 1.5e-3). The gates leave ~5x headroom.
+# Measured on TPU v6e (bf16 encoder vs the float32 CPU reference across
+# 799-3201 frames and the packed mixed-batch CPU parity check): relative L2
+# error 5.9e-3, max abs diff 1.7e-3 on outputs of magnitude ~0.19; batched vs
+# alone identical except the 30-frame sample (5.4e-3 / 1.5e-3). The gates
+# leave ~5x headroom.
 PARITY_MAX_REL_L2 = 3e-2
 PARITY_MAX_ABS = 1e-2
 
@@ -277,20 +281,20 @@ def encoders(
 ) -> Generator[Encoders, None, None]:
     """A bf16 TPU encoder and a float32 CPU reference sharing one set of weights.
 
-    The TPU encoder runs the patched forward, as in production. The CPU
-    reference runs the same module with native custom ops.
+    The TPU encoder runs the patched bucketed forward, as in production. The
+    CPU reference binds ``_tpu_orig_forward`` so it executes the unpatched
+    upstream forward with native custom ops.
     """
-    # The callback rewrites two attributes on the shared class. Register them
-    # first so the class is restored for the test modules that run after this
-    # one in the same process.
+    # The callback rewrites forward and sets _tpu_orig_forward on the shared
+    # class. Register both first so the class is restored for the test modules
+    # that run after this one in the same process.
     with pytest.MonkeyPatch.context() as mp:
         for cls in (VllmQwen3OmniMoeAudioEncoder, Qwen3OmniMoeAudioEncoder):
             mp.setattr(cls, "forward", cls.forward)
-            mp.setattr(cls, "_get_cnn_output_lengths", cls._get_cnn_output_lengths)
             mp.setattr(
                 cls,
-                "_tpu_orig_get_cnn_output_lengths",
-                getattr(cls, "_tpu_orig_get_cnn_output_lengths", None),
+                "_tpu_orig_forward",
+                getattr(cls, "_tpu_orig_forward", None),
                 raising=False,
             )
         # The registry callback with a thinker-stage config: the same path
@@ -303,6 +307,9 @@ def encoders(
         config = _tiny_audio_config()
         torch.manual_seed(0)
         cpu_encoder = Qwen3OmniMoeAudioEncoder(config).eval()
+        cpu_encoder.forward = MethodType(
+            Qwen3OmniMoeAudioEncoder._tpu_orig_forward, cpu_encoder
+        )
         _init_linear_weights(cpu_encoder, seed=0)
         assert all(torch.isfinite(p).all() for p in cpu_encoder.parameters())
         _route_custom_ops_to_cpu(cpu_encoder)
@@ -318,12 +325,12 @@ def encoders(
 def test_tpu_float_ceil_still_inexact_for_window_multiples(
     tpu_device: torch.device,
 ) -> None:
-    """Canary for the bug behind ``maybe_patch_qwen3_omni_thinker``.
+    """Canary for the TPU float-division bug in ``Qwen3OmniMoeAudioEncoder``.
 
     Evaluates the upstream ``chunk_num`` expression on TPU for every whole
     window up to 100 s of audio. When this fails, TPU rounds the division
-    exactly and the patch, the ``_get_cnn_output_lengths`` device hop and this
-    canary can be removed.
+    exactly and the CPU ``feature_lens`` hop and this canary can be retired
+    (while keeping static-shape bucketing).
     """
     window = _tiny_audio_config().n_window * 2
     lengths = torch.arange(window, 100 * window + 1, window)
@@ -332,8 +339,8 @@ def test_tpu_float_ceil_still_inexact_for_window_multiples(
     if torch.equal(upstream, exact):
         pytest.fail(
             "torch.ceil(feature_lens / 100) is exact on this TPU for every window "
-            "multiple up to 10000 frames. Remove maybe_patch_qwen3_omni_thinker "
-            "and this canary."
+            "multiple up to 10000 frames. The CPU feature_lens hop and this "
+            "canary can be retired."
         )
     assert torch.equal(torch.ceil(lengths / window).long(), exact), (
         "CPU math must be exact"
@@ -356,15 +363,23 @@ def test_audio_encoder_boundary_lengths_on_tpu(
 def test_audio_encoder_mixed_batch_on_tpu(encoders: Encoders) -> None:
     """A batch mixing exact multiples (800, 200) with partial windows (250, 30).
 
-    Checks the row count of the packed output and that each sample's rows match
-    the same sample encoded alone, so no chunk leaks into its neighbour.
+    Checks the row count of the packed output, numerical parity of the packed
+    batch against the float32 CPU reference, and that each sample's rows match
+    the same sample encoded alone so no chunk leaks into its neighbour.
     """
     per_sample = [encoders.features(n) for n in MIXED_BATCH]
-    out = _encode(
-        encoders.tpu, torch.cat(per_sample, dim=1), MIXED_BATCH, encoders.window
-    )
+    packed = torch.cat(per_sample, dim=1)
+    out = _encode(encoders.tpu, packed, MIXED_BATCH, encoders.window)
+    reference = _encode(encoders.cpu, packed, MIXED_BATCH, encoders.window)
     expected = [expected_tokens(n, encoders.window) for n in MIXED_BATCH]
     assert out.shape[0] == sum(expected)  # 104 + 33 + 26 + 4 = 167
+    assert_parity(
+        out,
+        reference,
+        name="audio encoder packed mixed batch, TPU bf16 vs CPU float32",
+        max_rel_l2=PARITY_MAX_REL_L2,
+        max_abs=PARITY_MAX_ABS,
+    )
 
     row = 0
     for n_frames, feats, n_tokens in zip(MIXED_BATCH, per_sample, expected):
@@ -382,7 +397,7 @@ def test_audio_encoder_mixed_batch_on_tpu(encoders: Encoders) -> None:
 
 @pytest.mark.parametrize("n_frames", PARITY_LENGTHS)
 def test_audio_encoder_matches_cpu_reference(encoders: Encoders, n_frames: int) -> None:
-    """The patched TPU forward matches the float32 CPU encoder around 8 s."""
+    """The patched TPU forward matches the float32 CPU encoder across buckets."""
     feats = encoders.features(n_frames)
     reference = _encode(encoders.cpu, feats, [n_frames], encoders.window)
     out = _encode(encoders.tpu, feats, [n_frames], encoders.window)
