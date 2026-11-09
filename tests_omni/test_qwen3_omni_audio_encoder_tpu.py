@@ -63,15 +63,12 @@ from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention,
 )
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.models.qwen3_omni_moe_thinker import (
-    Qwen3OmniMoeAudioEncoder as VllmQwen3OmniMoeAudioEncoder,
-)
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
-    Qwen3Omni_VisionTransformer,
     Qwen3OmniMoeAudioEncoder,
 )
 
 from tests_omni.omni_test_utils import assert_parity
+from tests_omni.test_qwen3omni_thinker_patch import _isolate_thinker_patch_targets
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _AUDIO_CHUNK_LENGTHS_PATCHED,
     maybe_patch_qwen3_omni_thinker,
@@ -290,18 +287,7 @@ def encoders(
     # class. Register both first so the class is restored for the test modules
     # that run after this one in the same process.
     with pytest.MonkeyPatch.context() as mp:
-        for cls in (
-            VllmQwen3OmniMoeAudioEncoder,
-            Qwen3OmniMoeAudioEncoder,
-            Qwen3Omni_VisionTransformer,
-        ):
-            mp.setattr(cls, "forward", cls.forward)
-            mp.setattr(
-                cls,
-                "_tpu_orig_forward",
-                getattr(cls, "_tpu_orig_forward", None),
-                raising=False,
-            )
+        _isolate_thinker_patch_targets(mp)
         # The registry callback with a thinker-stage config: the same path
         # TPUWorker.load_model() takes in production. Idempotent.
         assert maybe_patch_qwen3_omni_thinker(_thinker_model_config()) is True
