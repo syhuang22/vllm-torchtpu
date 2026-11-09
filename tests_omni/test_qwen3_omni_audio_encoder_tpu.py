@@ -67,6 +67,7 @@ from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeAudioEncoder as VllmQwen3OmniMoeAudioEncoder,
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+    Qwen3Omni_VisionTransformer,
     Qwen3OmniMoeAudioEncoder,
 )
 
@@ -289,7 +290,11 @@ def encoders(
     # class. Register both first so the class is restored for the test modules
     # that run after this one in the same process.
     with pytest.MonkeyPatch.context() as mp:
-        for cls in (VllmQwen3OmniMoeAudioEncoder, Qwen3OmniMoeAudioEncoder):
+        for cls in (
+            VllmQwen3OmniMoeAudioEncoder,
+            Qwen3OmniMoeAudioEncoder,
+            Qwen3Omni_VisionTransformer,
+        ):
             mp.setattr(cls, "forward", cls.forward)
             mp.setattr(
                 cls,
