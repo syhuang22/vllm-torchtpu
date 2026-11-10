@@ -54,7 +54,7 @@ logger = init_logger(__name__)
 def _prefix_1d(values: torch.Tensor, num_rows: int) -> torch.Tensor:
     if values.shape[0] == num_rows:
         return values
-    return tb_kernels.slice_rows_1d(values, num_rows)
+    return values[:num_rows]
 
 
 def _compute_request_state(
@@ -281,7 +281,9 @@ class ThinkingBudgetTracker:
         sync_fn(forced_full)
 
         has_spec_verify = max_draft_tokens > 0 and bool(verify_logits_paddings)
+        warmed_logit_rows: set[int] = set()
         for num_reqs in num_reqs_paddings:
+            warmed_logit_rows.add(num_reqs)
             forced_req = _prefix_1d(forced_full, num_reqs)
             selected = torch.zeros((num_reqs, 1), dtype=torch.int64).to(device)
             masked_plain, _ = tb_kernels.force_logits_rows(
@@ -290,19 +292,18 @@ class ThinkingBudgetTracker:
             state_table = tb_kernels.advance_plain_states(
                 state_table, slot_ids_full, selected, *kernel_args
             )
-            sync_fn([masked_plain, state_table])
+            to_sync: list[torch.Tensor] = [masked_plain]
             if precompile_top_tokens:
                 out_plain, state_table = tb_kernels.override_and_advance_plain(
                     state_table, slot_ids_full, selected, *kernel_args
                 )
+                to_sync.append(out_plain)
                 if has_spec_verify:
                     out_bonus_toks, _ = tb_kernels.force_token_ids(
                         torch.zeros(num_reqs, dtype=torch.int64).to(device),
                         forced_req,
                     )
-                    sync_fn([out_plain, out_bonus_toks, state_table])
-                else:
-                    sync_fn([out_plain, state_table])
+                    to_sync.append(out_bonus_toks)
             if has_spec_verify:
                 state_table = tb_kernels.advance_spec_states(
                     state_table,
@@ -315,7 +316,8 @@ class ThinkingBudgetTracker:
                     max_draft_tokens,
                     *kernel_args,
                 )
-                sync_fn(state_table)
+            to_sync.append(state_table)
+            sync_fn(to_sync)
             logger.info("  -- plain num_seqs: %d", num_reqs)
 
         if has_spec_verify:
@@ -334,22 +336,25 @@ class ThinkingBudgetTracker:
                     max_draft_tokens,
                     *kernel_args,
                 )
-                out_logits, did_force = tb_kernels.force_logits_rows(
-                    dummy_logits_fn(num_tokens), forced_tgt
-                )
                 eff_drafts = tb_kernels.invalidate_forced_drafts(
-                    draft_ids, forced_tgt, did_force
+                    draft_ids,
+                    forced_tgt,
+                    torch.zeros(num_tokens, dtype=torch.bool).to(device),
                 )
-                sync_fn([forced_bonus, out_logits, eff_drafts])
-                if precompile_top_tokens:
-                    out_toks, did_force_toks = tb_kernels.force_token_ids(
-                        torch.zeros(num_tokens, dtype=torch.int64).to(device),
-                        forced_tgt,
+                verify_sync: list[torch.Tensor] = [forced_bonus, eff_drafts]
+                if num_tokens not in warmed_logit_rows:
+                    warmed_logit_rows.add(num_tokens)
+                    out_logits, _ = tb_kernels.force_logits_rows(
+                        dummy_logits_fn(num_tokens), forced_tgt
                     )
-                    eff_top_drafts = tb_kernels.invalidate_forced_drafts(
-                        draft_ids, forced_tgt, did_force_toks
-                    )
-                    sync_fn([out_toks, eff_top_drafts])
+                    verify_sync.append(out_logits)
+                    if precompile_top_tokens:
+                        out_toks, _ = tb_kernels.force_token_ids(
+                            torch.zeros(num_tokens, dtype=torch.int64).to(device),
+                            forced_tgt,
+                        )
+                        verify_sync.append(out_toks)
+                sync_fn(verify_sync)
 
         self._slots.commit_table(state_table)
 

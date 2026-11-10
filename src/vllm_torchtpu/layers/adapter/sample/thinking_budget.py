@@ -499,12 +499,6 @@ def query_forced_tokens(
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def slice_rows_1d(values: torch.Tensor, num_rows: int) -> torch.Tensor:
-    """Slice ``values[:num_rows]`` inside a compiled 1D graph."""
-    return values[:num_rows]
-
-
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def force_logits_rows(
     logits: torch.Tensor,
     forced_ids: torch.Tensor,

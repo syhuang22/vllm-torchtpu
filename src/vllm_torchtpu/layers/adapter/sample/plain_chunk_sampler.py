@@ -50,7 +50,14 @@ class SampleFromLogitsFn(Protocol):
 
 
 class PlainChunkProcessor(Protocol):
-    """Per-chunk pre-sample mask and post-sample state update hook."""
+    """Per-chunk pre-sample mask and post-sample state update hook.
+
+    On the full-logits path (``top_tokens=False``), ``mask_logits`` runs before
+    sampling and ``on_sampled`` runs after sampling. On the ``top_tokens=True``
+    fast path (``TPU_GREEDY_TOP_TOKENS``), ``mask_logits`` and ``on_sampled``
+    are not called; ``override_top_tokens`` must both override token IDs and
+    advance any per-step processor state.
+    """
 
     def mask_logits(self, logits: torch.Tensor) -> torch.Tensor: ...
 
@@ -72,7 +79,9 @@ class StatelessPlainChunkProcessor:
         return None
 
     def override_top_tokens(self, selected_token_ids: torch.Tensor) -> torch.Tensor:
-        return selected_token_ids
+        raise AssertionError(
+            "StatelessPlainChunkProcessor cannot mask pre-selected top_tokens"
+        )
 
 
 def sample_plain_chunk(

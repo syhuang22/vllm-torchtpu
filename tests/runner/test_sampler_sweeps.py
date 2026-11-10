@@ -36,7 +36,7 @@ from vllm_torchtpu.structured_decoding import StructuredDecodingManager
 
 FLAG = "TPU_PARALLEL_PRECOMPILE"
 PADDINGS = [8, 16, 32, 64, 128, 256, 512, 1024]
-VERIFY_PADDINGS = [16, 32, 64, 128, 256, 512, 1024, 2048]
+VERIFY_PADDINGS = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
 
 
 def _reasoning_config() -> ReasoningConfig:
@@ -133,15 +133,17 @@ def test_flag_starts_each_local_rank_at_its_share_of_the_sweep(
 
 @pytest.mark.parametrize("rank", [0, 3, 7, 11])
 def test_thinking_budget_verify_logits_sweep_rotation(monkeypatch, rank):
+    verify_only = [n for n in VERIFY_PADDINGS if n not in PADDINGS]
     assert _sweep(
         monkeypatch,
         TPUModelRunner._precompile_thinking_budget,
         False,
         rank=rank,
         speculative=True,
-    ) == (PADDINGS + VERIFY_PADDINGS)
+    ) == (PADDINGS + verify_only)
     req_start = rank % 8 * len(PADDINGS) // 8
     ver_start = rank % 8 * len(VERIFY_PADDINGS) // 8
+    rot_ver = VERIFY_PADDINGS[ver_start:] + VERIFY_PADDINGS[:ver_start]
     assert _sweep(
         monkeypatch,
         TPUModelRunner._precompile_thinking_budget,
@@ -151,8 +153,7 @@ def test_thinking_budget_verify_logits_sweep_rotation(monkeypatch, rank):
     ) == (
         PADDINGS[req_start:]
         + PADDINGS[:req_start]
-        + VERIFY_PADDINGS[ver_start:]
-        + VERIFY_PADDINGS[:ver_start]
+        + [n for n in rot_ver if n not in PADDINGS]
     )
 
 
@@ -259,7 +260,6 @@ def test_rotated_sweeps_hold_no_collective():
     graphs += _trace(
         thinking_budget.query_forced_tokens, state_table, slot_ids, markers.end_ids
     )
-    graphs += _trace(thinking_budget.slice_rows_1d, forced_ids, n // 2)
     graphs += _trace(thinking_budget.force_logits_rows, logits, forced_ids)
     graphs += _trace(thinking_budget.force_token_ids, tokens_1d, forced_ids)
     graphs += _trace(

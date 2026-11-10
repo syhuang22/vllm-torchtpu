@@ -74,7 +74,6 @@ from vllm_torchtpu.layers.adapter.sample.thinking_budget import (
     prepare_spec_verify_drafts,
     query_forced_token,
     query_forced_tokens,
-    slice_rows_1d,
 )
 from vllm_torchtpu.layers.adapter.sample.thinking_budget_tracker import (
     ThinkingBudgetStepState,
@@ -737,7 +736,7 @@ class TestKMPKernelsFuzz:
             eff_t = invalidate_forced_drafts(draft_t, forced_tgt, did_f_t)
             raw_bonus_logits = torch.zeros((4, vocab_sz), dtype=torch.float32)
             raw_bonus_logits[:, 3] = 4.0
-            forced_bonus_4 = slice_rows_1d(forced_bonus, 4)
+            forced_bonus_4 = forced_bonus[:4]
             fbonus_l, _ = force_logits_rows(raw_bonus_logits, forced_bonus_4)
             fbonus_t, _ = force_token_ids(
                 torch.full((4,), 3, dtype=torch.int64), forced_bonus_4
@@ -1531,6 +1530,19 @@ class TestSampleTokens:
         assert slot_r0 == 1
         assert int(tb_step.state_table[slot_r0, COL_THINK_COUNT].item()) == 1
 
+        stateless = plain_chunk_sampler.StatelessPlainChunkProcessor(grammar_block_99)
+        with pytest.raises(AssertionError, match="top_tokens"):
+            plain_chunk_sampler.sample_plain_chunk(
+                torch.tensor([[12]], dtype=torch.int64),
+                cur_start_idx=0,
+                cur_end_idx=1,
+                top_tokens=True,
+                all_greedy=True,
+                sampling_generator=None,
+                sample_stage=nullcontext(),
+                processors=(stateless,),
+            )
+
     @pytest.mark.parametrize(
         "mode",
         [
@@ -1745,7 +1757,6 @@ class TestPrecompileAndTPU:
                 for mod, orig_fn in (
                     (request_slot_table, seed_slot_rows),
                     (tb_kernels, query_forced_tokens),
-                    (tb_kernels, slice_rows_1d),
                     (tb_kernels, force_logits_rows),
                     (tb_kernels, force_token_ids),
                     (tb_kernels, invalidate_forced_drafts),
@@ -1907,7 +1918,7 @@ class TestPrecompileAndTPU:
             )
             fl_cpu, df_l_cpu = force_logits_rows(logits_cpu, ftgt_cpu)
             ed_cpu = invalidate_forced_drafts(drafts_cpu, ftgt_cpu, df_l_cpu)
-            fbon_2_cpu = slice_rows_1d(fbon_cpu, 2)
+            fbon_2_cpu = fbon_cpu[:2]
             fbl_cpu, _ = force_logits_rows(bonus_logits_cpu, fbon_2_cpu)
             ft_cpu, df_t_cpu = force_token_ids(
                 torch.arange(16, dtype=torch.int64), ftgt_cpu
@@ -1926,7 +1937,7 @@ class TestPrecompileAndTPU:
         )
         fl_tpu, df_l_tpu = force_logits_rows(logits_cpu.to(tpu), ftgt_tpu)
         ed_tpu = invalidate_forced_drafts(drafts_cpu.to(tpu), ftgt_tpu, df_l_tpu)
-        fbon_2_tpu = slice_rows_1d(fbon_tpu, 2)
+        fbon_2_tpu = fbon_tpu[:2]
         fbl_tpu, _ = force_logits_rows(bonus_logits_cpu.to(tpu), fbon_2_tpu)
         ft_tpu, df_t_tpu = force_token_ids(
             torch.arange(16, dtype=torch.int64).to(tpu), ftgt_tpu

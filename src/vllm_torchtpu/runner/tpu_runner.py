@@ -5471,8 +5471,7 @@ class TPUModelRunner(GPUModelRunner):
                             )
                         )
                 else:
-                    selected, logprob_logits = TPUModelRunner._sample_plain_chunk(
-                        self,
+                    selected, logprob_logits = self._sample_plain_chunk(
                         logits,
                         cur_start_idx=cur_start_idx,
                         cur_end_idx=cur_end_idx,
@@ -5524,8 +5523,7 @@ class TPUModelRunner(GPUModelRunner):
                 # Non-spec step (prefill / plain decode): reset the mamba
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
-                selected_token_ids, logprob_logits = TPUModelRunner._sample_plain_chunk(
-                    self,
+                selected_token_ids, logprob_logits = self._sample_plain_chunk(
                     logits,
                     cur_start_idx=cur_start_idx,
                     cur_end_idx=cur_end_idx,
