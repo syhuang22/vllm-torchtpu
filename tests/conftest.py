@@ -84,6 +84,57 @@ def _reset_warning_once():
     vllm.logger._print_warning_once.cache_clear()
 
 
+# Knobs that are on when unset.
+DEFAULT_ON_KNOBS = (
+    "TPU_CACHED_PROMPT_ROWS",
+    "TPU_CP_EARLY_HALO",
+    "TPU_CP_EMBED_REPLICA",
+    "TPU_CP_FP8_ATTENTION",
+    "TPU_CP_FUSED_EPILOGUE",
+    "TPU_CP_FUSED_PROLOGUE",
+    "TPU_CP_KV_WRITE_KERNEL",
+    "TPU_CP_MOE_NO_EP",
+    "TPU_CP_PAGED_GATHER",
+    "TPU_FP8_ATTENTION",
+    "TPU_FP8_DECODE_GEMV_MAX_ROWS",
+    "TPU_GEMMA4_CP_MIN_TOKENS",
+    "TPU_GEMMA4_FUSED_ATTN_PROLOGUE",
+    "TPU_GEMMA4_FUSED_NORM_QUANT",
+    "TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT",
+    "TPU_GEMMA4_ROUTER_TOPK_KERNEL",
+    "TPU_GEMMA4_SEQUENCE_PARALLEL",
+    "TPU_GEMMA4_SHARED_KV_PAGES",
+    "TPU_GEMMA4_TOPK_SOFTMAX_ROUTING",
+    "TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS",
+    "TPU_LM_HEAD_FP8_DECODE",
+    "TPU_MOE_GATHER_GMM",
+    "TPU_MOE_GATHER_GMM_CHUNKED_COMBINE",
+    "TPU_MOE_GATHER_GMM_TOKEN_SCALES",
+    "TPU_MOE_GATHER_GMM_V2",
+    "TPU_NORM_WEIGHTS_FP32",
+    "TPU_REUSE_STAGED_BLOCK_TABLES",
+    "TPU_RPA_CAP_SLIDING_DECODE_BLOCK",
+    "TPU_RPA_FENCE_OUTPUT",
+    "TPU_RPA_PROLOGUE_DMA_STORES",
+    "TPU_RPA_PROLOGUE_FP8_QUERIES",
+    "TPU_RPA_SKIP_EMPTY_LAUNCH",
+    "TPU_RPA_SKIP_MASKED_KV_ZERO_FILL",
+    "TPU_RPA_UNMASKED_INTERIOR",
+    "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS",
+)
+
+
+@pytest.fixture
+def default_on_knobs_off(monkeypatch):
+    """Turn every default-on knob off through the environment.
+
+    For test modules that enable these knobs one at a time: a test then turns
+    on exactly the ones it exercises.
+    """
+    for name in DEFAULT_ON_KNOBS:
+        monkeypatch.setenv(name, "0")
+
+
 @pytest.fixture
 def vllm_config_context():
     """Run backend helpers with the same resolved layout as worker startup."""

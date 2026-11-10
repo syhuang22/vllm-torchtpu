@@ -52,6 +52,8 @@ from vllm_torchtpu.platforms.tpu_platform import (
     get_tpu_multihost_topology,
 )
 
+pytestmark = pytest.mark.usefixtures("default_on_knobs_off")
+
 
 @pytest.mark.parametrize(
     "hybrid,unified,resumable,blocked",

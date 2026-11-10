@@ -34,6 +34,8 @@ from vllm_torchtpu.layers.adapter.quantization import fp8
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantLinearConfig
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 
+pytestmark = pytest.mark.usefixtures("default_on_knobs_off")
+
 
 def _operands(rows, k, n, seed=0):
     x = jax.random.normal(jax.random.key(seed), (rows, k), jnp.float32)

@@ -21,20 +21,20 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
-    TPU_GEMMA4_SEQUENCE_PARALLEL: bool = False
+    TPU_GEMMA4_SEQUENCE_PARALLEL: bool = True
     TPU_GEMMA4_SP_MICROBATCHES: int = 1
-    TPU_GEMMA4_FUSED_NORM_QUANT: bool = False
-    TPU_GEMMA4_CP_MIN_TOKENS: int = 0
-    TPU_CP_KV_WRITE_KERNEL: bool = False
-    TPU_CP_FP8_ATTENTION: bool = False
-    TPU_CP_FUSED_PROLOGUE: bool = False
-    TPU_CP_EMBED_REPLICA: bool = False
-    TPU_CP_FUSED_EPILOGUE: bool = False
-    TPU_CP_EARLY_HALO: bool = False
-    TPU_CP_PAGED_GATHER: bool = False
-    TPU_CP_MOE_NO_EP: bool = False
+    TPU_GEMMA4_FUSED_NORM_QUANT: bool = True
+    TPU_GEMMA4_CP_MIN_TOKENS: int = 16384
+    TPU_CP_KV_WRITE_KERNEL: bool = True
+    TPU_CP_FP8_ATTENTION: bool = True
+    TPU_CP_FUSED_PROLOGUE: bool = True
+    TPU_CP_EMBED_REPLICA: bool = True
+    TPU_CP_FUSED_EPILOGUE: bool = True
+    TPU_CP_EARLY_HALO: bool = True
+    TPU_CP_PAGED_GATHER: bool = True
+    TPU_CP_MOE_NO_EP: bool = True
     TPU_K3_SP_PREFILL: bool = False
-    TPU_FP8_ATTENTION: bool = False
+    TPU_FP8_ATTENTION: bool = True
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
@@ -60,9 +60,9 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
-    TPU_FP8_DECODE_GEMV_MAX_ROWS: int = 0
-    TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS: int = 0
-    TPU_LM_HEAD_FP8_DECODE: bool = False
+    TPU_FP8_DECODE_GEMV_MAX_ROWS: int = 64
+    TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS: int = 64
+    TPU_LM_HEAD_FP8_DECODE: bool = True
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -90,11 +90,11 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
-    TPU_MOE_GATHER_GMM: bool = False
+    TPU_MOE_GATHER_GMM: bool = True
     TPU_MOE_GATHER_GMM_MIN_TOKENS: int = 1024
-    TPU_MOE_GATHER_GMM_CHUNKED_COMBINE: bool = False
-    TPU_MOE_GATHER_GMM_V2: bool = False
-    TPU_MOE_GATHER_GMM_TOKEN_SCALES: bool = False
+    TPU_MOE_GATHER_GMM_CHUNKED_COMBINE: bool = True
+    TPU_MOE_GATHER_GMM_V2: bool = True
+    TPU_MOE_GATHER_GMM_TOKEN_SCALES: bool = True
     TPU_MOE_TP_EXPERT_SPLIT: bool = False
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -106,20 +106,20 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
-    TPU_RPA_SKIP_EMPTY_LAUNCH: bool = False
-    TPU_RPA_FENCE_OUTPUT: bool = False
-    TPU_GEMMA4_FUSED_ATTN_PROLOGUE: bool = False
+    TPU_RPA_SKIP_EMPTY_LAUNCH: bool = True
+    TPU_RPA_FENCE_OUTPUT: bool = True
+    TPU_GEMMA4_FUSED_ATTN_PROLOGUE: bool = True
     TPU_GEMMA4_FUSED_GELU_QUANT: bool = False
     TPU_GEMMA4_GELU_QUANT_BF16: bool = False
-    TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT: bool = False
-    TPU_RPA_CAP_SLIDING_DECODE_BLOCK: bool = False
+    TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT: bool = True
+    TPU_RPA_CAP_SLIDING_DECODE_BLOCK: bool = True
     TPU_RPA_SLIDING_PREFILL_MAX_BKV: int = 0
-    TPU_RPA_UNMASKED_INTERIOR: bool = False
-    TPU_RPA_SKIP_MASKED_KV_ZERO_FILL: bool = False
-    TPU_RPA_PROLOGUE_DMA_STORES: bool = False
-    TPU_RPA_PROLOGUE_FP8_QUERIES: bool = False
+    TPU_RPA_UNMASKED_INTERIOR: bool = True
+    TPU_RPA_SKIP_MASKED_KV_ZERO_FILL: bool = True
+    TPU_RPA_PROLOGUE_DMA_STORES: bool = True
+    TPU_RPA_PROLOGUE_FP8_QUERIES: bool = True
     TPU_RPA_SLIDING_DECODE_LANES: int = 0
-    TPU_GEMMA4_SHARED_KV_PAGES: bool = False
+    TPU_GEMMA4_SHARED_KV_PAGES: bool = True
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -134,8 +134,8 @@ if TYPE_CHECKING:
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
-    TPU_GEMMA4_TOPK_SOFTMAX_ROUTING: bool = False
-    TPU_GEMMA4_ROUTER_TOPK_KERNEL: bool = False
+    TPU_GEMMA4_TOPK_SOFTMAX_ROUTING: bool = True
+    TPU_GEMMA4_ROUTER_TOPK_KERNEL: bool = True
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
@@ -158,7 +158,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
-    TPU_NORM_WEIGHTS_FP32: bool = False
+    TPU_NORM_WEIGHTS_FP32: bool = True
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
@@ -239,8 +239,8 @@ if TYPE_CHECKING:
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
-    TPU_REUSE_STAGED_BLOCK_TABLES: bool = False
-    TPU_CACHED_PROMPT_ROWS: bool = False
+    TPU_REUSE_STAGED_BLOCK_TABLES: bool = True
+    TPU_CACHED_PROMPT_ROWS: bool = True
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
@@ -249,7 +249,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
-    VLLM_TPU_SOLO_PREFILL_OVER_TOKENS: int = 0
+    VLLM_TPU_SOLO_PREFILL_OVER_TOKENS: int = 8192
     VLLM_TPU_SOLO_PREFILL_MAX_CONSECUTIVE: int = 0
     VLLM_TPU_SOLO_PREFILL_DECODE_STEPS: int = 1
 
@@ -491,7 +491,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-reduces. Not with drafters that read auxiliary hidden states (EAGLE3,
     # DFlash, DSpark). See models/vllm/gemma4_patch.py.
     "TPU_GEMMA4_SEQUENCE_PARALLEL": env_bool(
-        "TPU_GEMMA4_SEQUENCE_PARALLEL", default=False
+        "TPU_GEMMA4_SEQUENCE_PARALLEL", default=True
     ),
     # With TPU_GEMMA4_SEQUENCE_PARALLEL: split a large bucket into this many
     # contiguous token chunks whose collectives and projections can overlap.
@@ -502,61 +502,63 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (kernels/norm_quant.py) instead of four XLA passes; on a MoE layer, so
     # do the three norms, add and layer scalar after the experts. Rounding: the
     # norms' sums of squares are added in another order, so values can move.
-    "TPU_GEMMA4_FUSED_NORM_QUANT": env_bool("TPU_GEMMA4_FUSED_NORM_QUANT"),
+    "TPU_GEMMA4_FUSED_NORM_QUANT": env_bool(
+        "TPU_GEMMA4_FUSED_NORM_QUANT", default=True
+    ),
     # Gemma4ForCausalLM at TP >= 2: token buckets of at least this many tokens
     # run context-parallel over the TP group (zigzag pieces of the step's one
     # prompt per rank, every projection whole on every rank); 0 disables. Needs
     # VLLM_TPU_SOLO_PREFILL_OVER_TOKENS whose bucket is the one below. See
     # models/vllm/gemma4_patch.py.
-    "TPU_GEMMA4_CP_MIN_TOKENS": env_nonnegative_int("TPU_GEMMA4_CP_MIN_TOKENS", 0),
+    "TPU_GEMMA4_CP_MIN_TOKENS": env_nonnegative_int("TPU_GEMMA4_CP_MIN_TOKENS", 16384),
     # Context-parallel prefill (layers/adapter/cp_prefill_attention.py): a
     # full-attention layer caches its KV heads of the gathered pages with a
     # Pallas kernel that picks the heads' slots in VMEM, instead of an XLA slice
     # of the packed slot axis (SEQ_ALONG_LANE caches: one KV head per rank).
     # Same bytes.
-    "TPU_CP_KV_WRITE_KERNEL": env_bool("TPU_CP_KV_WRITE_KERNEL", default=False),
+    "TPU_CP_KV_WRITE_KERNEL": env_bool("TPU_CP_KV_WRITE_KERNEL", default=True),
     # With TPU_FP8_ATTENTION, context-parallel prefill: a layer whose query heads
     # per KV head, counted over all ranks, are whole fp8 packing groups runs fp8
     # QK^T and PV (`ragged_paged_attention(fp8_compute=True)`) even where its
     # tensor-parallel shard's ratio does not qualify (Gemma4-26B full attention
     # at TP8).
-    "TPU_CP_FP8_ATTENTION": env_bool("TPU_CP_FP8_ATTENTION", default=False),
+    "TPU_CP_FP8_ATTENTION": env_bool("TPU_CP_FP8_ATTENTION", default=True),
     # Gemma4 context-parallel prefill: each layer's attention starts from its
     # qkv projection rows; one Pallas pass (batched_rpa/prologue.py) runs the
     # q/k/v norms, rotary and FP8 K/V quantization and writes the attention
     # kernel's query and K/V layouts, which the CP ops take as they are.
-    "TPU_CP_FUSED_PROLOGUE": env_bool("TPU_CP_FUSED_PROLOGUE", default=False),
+    "TPU_CP_FUSED_PROLOGUE": env_bool("TPU_CP_FUSED_PROLOGUE", default=True),
     # Gemma4 context-parallel prefill: the projection replica also holds the
     # whole embedding table (the model's embedding weights again on every
     # rank), so a rank looks up its own rows instead of every row of the
     # step in its vocab shard followed by a reduce-scatter. Same values.
-    "TPU_CP_EMBED_REPLICA": env_bool("TPU_CP_EMBED_REPLICA", default=False),
+    "TPU_CP_EMBED_REPLICA": env_bool("TPU_CP_EMBED_REPLICA", default=True),
     # Context-parallel prefill: each layer's attention returns its output as
     # the o projection's per-token fp8 rows and scales, quantized by a Pallas
     # kernel straight from the attention kernel's head-major output, instead of
     # bf16 token-major rows that XLA transposes and quantizes.
-    "TPU_CP_FUSED_EPILOGUE": env_bool("TPU_CP_FUSED_EPILOGUE", default=False),
+    "TPU_CP_FUSED_EPILOGUE": env_bool("TPU_CP_FUSED_EPILOGUE", default=True),
     # With TPU_CP_FUSED_PROLOGUE: a context-parallel sliding-window layer runs
     # the qkv prologue of the rows it sends (its pieces' tails and the decode
     # window) first, so its all-gather overlaps the prologue of the other rows
     # instead of waiting for all of them. Same rows.
-    "TPU_CP_EARLY_HALO": env_bool("TPU_CP_EARLY_HALO", default=False),
+    "TPU_CP_EARLY_HALO": env_bool("TPU_CP_EARLY_HALO", default=True),
     # With TPU_CP_FUSED_PROLOGUE: the context-parallel layers all-gather their
     # fp8 K/V as int8 rows in the prologue's [rows, slots, packing, d] layout,
     # which the attention's page buffers split without a copy, instead of as
     # 2-D [rows, slots * packing * d] rows. Same bytes.
-    "TPU_CP_PAGED_GATHER": env_bool("TPU_CP_PAGED_GATHER", default=False),
+    "TPU_CP_PAGED_GATHER": env_bool("TPU_CP_PAGED_GATHER", default=True),
     # Gemma4 context-parallel prefill: the projection replica's experts (every
     # expert on every rank) run the MoE path without expert parallelism, which
     # --enable-expert-parallel otherwise selects for every MoE layer. Every
     # route is valid either way; device numerics not yet shown bitexact.
-    "TPU_CP_MOE_NO_EP": env_bool("TPU_CP_MOE_NO_EP", default=False),
+    "TPU_CP_MOE_NO_EP": env_bool("TPU_CP_MOE_NO_EP", default=True),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # CUSTOM (batched RPA) attention: run the mixed (prefill) kernel's QK^T and
     # PV as fp8 x fp8 matmuls on layers with an fp8 KV cache and a multiple of 4
     # query heads per KV head (`ragged_paged_attention(fp8_compute=True)`).
-    "TPU_FP8_ATTENTION": env_bool("TPU_FP8_ATTENTION", default=False),
+    "TPU_FP8_ATTENTION": env_bool("TPU_FP8_ATTENTION", default=True),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
     # top-k slots per token instead of all `topk`; tokens owning more are
     # recomputed exactly in-kernel over all their windows
@@ -697,28 +699,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
         "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
     ),
-    # Opt-in weight-streaming kernel for small FP8 dense-linear steps. A step
+    # Weight-streaming kernel for small FP8 dense-linear steps. A step
     # whose padded token bucket has at most this many rows runs its per-channel
     # W8A8 projection as one Pallas weight stream that quantizes the rows while
     # the first weight tiles land (kernels/quantized_matmul/decode_gemv.py)
     # instead of XLA's activation-quantization fusions and dot fusion. Same
     # quantization and scaling; the FP8 dot accumulates in Mosaic's order, which
     # on some shapes rounds differently from XLA's. Buckets under
-    # TPU_FP8_LINEAR_W8A16_MAX_ROWS keep W8A16. 0 (default) keeps XLA.
+    # TPU_FP8_LINEAR_W8A16_MAX_ROWS keep W8A16. 0 keeps XLA.
     "TPU_FP8_DECODE_GEMV_MAX_ROWS": env_nonnegative_int(
-        "TPU_FP8_DECODE_GEMV_MAX_ROWS", 0
+        "TPU_FP8_DECODE_GEMV_MAX_ROWS", 64
     ),
-    # Opt-in weight stream for the unquantized LM head on small buckets: a
+    # Weight stream for the unquantized LM head on small buckets: a
     # logits step of at most this many rows (a multiple of 8) runs x @ w.T as
     # one Pallas kernel that keeps four row tiles of the [vocab shard, hidden]
     # weight in flight (decode_gemv.decode_matmul_nt), instead of XLA's dot.
-    # f32 accumulation in Mosaic's order. 0 (default) keeps upstream's matmul.
+    # f32 accumulation in Mosaic's order. 0 keeps upstream's matmul.
     "TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS": env_nonnegative_int(
-        "TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS", 0
+        "TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS", 64
     ),
     # With TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS: those logits buckets stream an FP8
     # copy of the (bf16) LM head, quantized per vocab row at load.
-    "TPU_LM_HEAD_FP8_DECODE": env_bool("TPU_LM_HEAD_FP8_DECODE"),
+    "TPU_LM_HEAD_FP8_DECODE": env_bool("TPU_LM_HEAD_FP8_DECODE", default=True),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
@@ -860,7 +862,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # HBM. Applies to batches of at least TPU_MOE_GATHER_GMM_MIN_TOKENS
     # tokens; smaller batches and unsupported layouts or sizes keep the
     # grouped-matmul path (can_use_gather_gmm in layers/core/fused_moe_gmm.py).
-    "TPU_MOE_GATHER_GMM": env_bool("TPU_MOE_GATHER_GMM"),
+    "TPU_MOE_GATHER_GMM": env_bool("TPU_MOE_GATHER_GMM", default=True),
     "TPU_MOE_GATHER_GMM_MIN_TOKENS": env_nonnegative_int(
         "TPU_MOE_GATHER_GMM_MIN_TOKENS", 1024
     ),
@@ -869,17 +871,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # chunks of at most that many routes (its SMEM-prefetched route table);
     # without it they keep the grouped-matmul path.
     "TPU_MOE_GATHER_GMM_CHUNKED_COMBINE": env_bool(
-        "TPU_MOE_GATHER_GMM_CHUNKED_COMBINE"
+        "TPU_MOE_GATHER_GMM_CHUNKED_COMBINE", default=True
     ),
     # With TPU_MOE_GATHER_GMM: the expert kernel is gather_fused_moe_v2, which
     # starts each tile's row DMAs from inside an earlier tile's compute instead
     # of in a scalar loop before its own. Same arithmetic and output bits.
-    "TPU_MOE_GATHER_GMM_V2": env_bool("TPU_MOE_GATHER_GMM_V2"),
+    "TPU_MOE_GATHER_GMM_V2": env_bool("TPU_MOE_GATHER_GMM_V2", default=True),
     # With TPU_MOE_GATHER_GMM_V2: the expert kernel quantizes with one FP8
     # activation scale per token (and per row of the activation for down)
     # instead of one per 512 columns, each dequantizing an F32 product over
     # the whole contraction. Changes the MoE arithmetic (tolerance tier).
-    "TPU_MOE_GATHER_GMM_TOKEN_SCALES": env_bool("TPU_MOE_GATHER_GMM_TOKEN_SCALES"),
+    "TPU_MOE_GATHER_GMM_TOKEN_SCALES": env_bool(
+        "TPU_MOE_GATHER_GMM_TOKEN_SCALES", default=True
+    ),
     # MoE layers that run without expert parallelism (no
     # --enable-expert-parallel) on a tensor-parallel group, with no data,
     # pipeline-context or sequence parallelism inside the engine: give each TP
@@ -951,19 +955,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # decode-only step, the decode kernel of a prefill-only step) skips its
     # VMEM zero-fill and its schedule's HBM write-back instead of running
     # zero steps on initialized buffers. Outputs are unchanged.
-    "TPU_RPA_SKIP_EMPTY_LAUNCH": env_bool("TPU_RPA_SKIP_EMPTY_LAUNCH"),
+    "TPU_RPA_SKIP_EMPTY_LAUNCH": env_bool("TPU_RPA_SKIP_EMPTY_LAUNCH", default=True),
     # Batched RPA writes its output head-major and transposes it to token-major
     # for the caller. Without a fence XLA fuses that transpose into the
     # consumer, the o_proj's FP8 activation quantization, and moves the output
     # twice in f32. With it the transpose is one bf16 copy and the quantization
     # reads token-major rows. Outputs are unchanged.
-    "TPU_RPA_FENCE_OUTPUT": env_bool("TPU_RPA_FENCE_OUTPUT"),
+    "TPU_RPA_FENCE_OUTPUT": env_bool("TPU_RPA_FENCE_OUTPUT", default=True),
     # Gemma4 attention hands its qkv projection's rows to the batched RPA
     # backend, which runs the q/k/v norms, rotary, FP8 KV quantization and the
     # kernel's input layouts in one Pallas pass instead of XLA's dozen
     # (models/vllm/gemma4_attention_patch.py). Rounding: the norms' sums of
     # squares are added in another order, so values can move one step.
-    "TPU_GEMMA4_FUSED_ATTN_PROLOGUE": env_bool("TPU_GEMMA4_FUSED_ATTN_PROLOGUE"),
+    "TPU_GEMMA4_FUSED_ATTN_PROLOGUE": env_bool(
+        "TPU_GEMMA4_FUSED_ATTN_PROLOGUE", default=True
+    ),
     # Gemma4's GeGLU (tanh GELU) and the down projection's per-token FP8 input
     # quantization run as one Pallas pass (models/vllm/gemma4_mlp_patch.py,
     # kernels/gelu_quant.py) instead of XLA's two passes over the activation.
@@ -978,12 +984,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the output rows quantized per token, made in one Pallas pass over the
     # kernel's head-major output (batched_rpa/output_quant.py) instead of
     # XLA's transpose, f32 copy, row-maximum pass and column-major cast.
-    "TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT": env_bool("TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT"),
+    "TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT": env_bool(
+        "TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT", default=True
+    ),
     # Cap the batched-RPA decode KV block of sliding-window layers at half the
     # window, rounded down to the block stride. The default block fills VMEM
     # (1792 tokens for a 1024-token window on Gemma4), and each decode launch
     # zero-fills and computes every lane of it.
-    "TPU_RPA_CAP_SLIDING_DECODE_BLOCK": env_bool("TPU_RPA_CAP_SLIDING_DECODE_BLOCK"),
+    "TPU_RPA_CAP_SLIDING_DECODE_BLOCK": env_bool(
+        "TPU_RPA_CAP_SLIDING_DECODE_BLOCK", default=True
+    ),
     # Largest batched-RPA mixed (prefill) KV and query block (tokens) on
     # sliding-window layers, rounded down to the block stride and no smaller
     # than the default minimum block. Blocks start at multiples of the KV block,
@@ -998,21 +1008,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # query of the step sees whole (all of a long prompt's steps but those on
     # the diagonal and the window edge) runs a mask-free copy of the step body,
     # which saves a compare and a select per logit. Outputs are unchanged.
-    "TPU_RPA_UNMASKED_INTERIOR": env_bool("TPU_RPA_UNMASKED_INTERIOR"),
+    "TPU_RPA_UNMASKED_INTERIOR": env_bool("TPU_RPA_UNMASKED_INTERIOR", default=True),
     # Batched RPA kernels zero their KV VMEM window at entry so stale VMEM
     # cannot reach PV. Under VLLM_KV_CACHE_LAYOUT=HND the decode kernel masks
     # unwritten V rows and out-of-range keys anyway; with this on it skips the
     # fill. Outputs are unchanged.
-    "TPU_RPA_SKIP_MASKED_KV_ZERO_FILL": env_bool("TPU_RPA_SKIP_MASKED_KV_ZERO_FILL"),
+    "TPU_RPA_SKIP_MASKED_KV_ZERO_FILL": env_bool(
+        "TPU_RPA_SKIP_MASKED_KV_ZERO_FILL", default=True
+    ),
     # The fused qkv prologue (TPU_GEMMA4_FUSED_ATTN_PROLOGUE, and the
     # context-parallel programs' under TPU_CP_FUSED_PROLOGUE) builds its packed
     # q and K/V rows as 32-bit words in contiguous VMEM buffers and writes them
     # with strided DMAs, instead of sublane-packing stores. Outputs unchanged.
-    "TPU_RPA_PROLOGUE_DMA_STORES": env_bool("TPU_RPA_PROLOGUE_DMA_STORES"),
+    "TPU_RPA_PROLOGUE_DMA_STORES": env_bool(
+        "TPU_RPA_PROLOGUE_DMA_STORES", default=True
+    ),
     # With TPU_RPA_PROLOGUE_DMA_STORES: on fp8_compute layers the prologue also
     # writes the FP8 queries the mixed kernel reads, instead of a separate XLA
     # cast and relayout of its bf16 queries (wrapper.quantize_queries).
-    "TPU_RPA_PROLOGUE_FP8_QUERIES": env_bool("TPU_RPA_PROLOGUE_FP8_QUERIES"),
+    "TPU_RPA_PROLOGUE_FP8_QUERIES": env_bool(
+        "TPU_RPA_PROLOGUE_FP8_QUERIES", default=True
+    ),
     # Lanes of the batched-RPA decode kernel on sliding-window layers, when
     # fewer than the default 8; the KV block stays the default's. Every lane of
     # a step is computed, active or not, and one decode sequence's window spans
@@ -1026,7 +1042,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the value elsewhere; the queries carry that factor). Needs the batched
     # RPA backend, VLLM_KV_CACHE_LAYOUT=HND, an fp8 KV cache and one KV head
     # per rank; global-layer decode reads 640 instead of 1024 bytes per token.
-    "TPU_GEMMA4_SHARED_KV_PAGES": env_bool("TPU_GEMMA4_SHARED_KV_PAGES"),
+    "TPU_GEMMA4_SHARED_KV_PAGES": env_bool("TPU_GEMMA4_SHARED_KV_PAGES", default=True),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.
@@ -1067,12 +1083,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of upstream's full softmax, one-hot renormalization and two
     # gathers. Same top-k ids; weights equal up to float32 rounding for the
     # float32 logits the TPU gate emits (bf16 logits differ at bf16 precision).
-    "TPU_GEMMA4_TOPK_SOFTMAX_ROUTING": env_bool("TPU_GEMMA4_TOPK_SOFTMAX_ROUTING"),
+    "TPU_GEMMA4_TOPK_SOFTMAX_ROUTING": env_bool(
+        "TPU_GEMMA4_TOPK_SOFTMAX_ROUTING", default=True
+    ),
     # With TPU_GEMMA4_TOPK_SOFTMAX_ROUTING: the router's top-k logits and each
     # selected expert's per_expert_scale come from one sort-free Pallas pass
     # (kernels/router_topk.select_scaled) instead of a full sort of the logits
     # and a compare-select-sum over the experts. Ties go to the lowest id.
-    "TPU_GEMMA4_ROUTER_TOPK_KERNEL": env_bool("TPU_GEMMA4_ROUTER_TOPK_KERNEL"),
+    "TPU_GEMMA4_ROUTER_TOPK_KERNEL": env_bool(
+        "TPU_GEMMA4_ROUTER_TOPK_KERNEL", default=True
+    ),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
@@ -1153,7 +1173,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # upcast_norm_weights). The TPU rms_norm providers multiply in float32, so
     # outputs do not change where every norm goes through them (verified on
     # Gemma4); code that reads norm weights directly sees float32.
-    "TPU_NORM_WEIGHTS_FP32": env_bool("TPU_NORM_WEIGHTS_FP32"),
+    "TPU_NORM_WEIGHTS_FP32": env_bool("TPU_NORM_WEIGHTS_FP32", default=True),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
@@ -1498,12 +1518,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # step stages is unchanged (most decode steps), instead of packing,
     # uploading and splitting them again on the host path. Skipped for
     # dummy runs and mamba groups.
-    "TPU_REUSE_STAGED_BLOCK_TABLES": env_bool("TPU_REUSE_STAGED_BLOCK_TABLES"),
+    "TPU_REUSE_STAGED_BLOCK_TABLES": env_bool(
+        "TPU_REUSE_STAGED_BLOCK_TABLES", default=True
+    ),
     # Keep each request's prompt as an int32 array next to its token list, so
     # that re-adding a request to the persistent batch (after it sat steps
     # out, e.g. a solo prefill) copies the prompt row as one array copy instead
     # of converting the list (runner/prompt_rows.py).
-    "TPU_CACHED_PROMPT_ROWS": env_bool("TPU_CACHED_PROMPT_ROWS"),
+    "TPU_CACHED_PROMPT_ROWS": env_bool("TPU_CACHED_PROMPT_ROWS", default=True),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
@@ -1557,7 +1579,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # many tokens to compute, none computed yet, are prefilled whole, each in
     # a step of its own; every other step schedules at most this many tokens.
     "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS": env_nonnegative_int(
-        "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", 0
+        "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", 8192
     ),
     # PrefillFirstScheduler: solo prefill steps in a row while requests are
     # running (0: no limit).

@@ -718,6 +718,7 @@ def _gather_gmm_case(**overrides):
 )
 def test_can_use_gather_gmm(monkeypatch, overrides, fp8_mxu, expected):
     monkeypatch.setattr(fused_moe_gmm, "_GATHER_GMM_MIN_TOKENS", 1024)
+    monkeypatch.setattr(fused_moe_gmm, "_GATHER_GMM_CHUNKED_COMBINE", False)
     monkeypatch.setattr(fused_moe_gmm, "_tpu_has_fp8_matmul", lambda: fp8_mxu)
     # tpu7x: 64 MiB of VMEM per core.
     monkeypatch.setattr(fused_moe_gmm, "_tpu_vmem_capacity_bytes", lambda: 64 << 20)

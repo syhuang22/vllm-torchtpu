@@ -49,6 +49,8 @@ from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.models.vllm import gemma4_patch
 
+pytestmark = pytest.mark.usefixtures("default_on_knobs_off")
+
 _UPSTREAM_LAYER_FORWARD = Gemma4DecoderLayer.forward
 
 

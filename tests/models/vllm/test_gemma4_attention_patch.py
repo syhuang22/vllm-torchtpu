@@ -24,6 +24,8 @@ from vllm.model_executor.models.gemma4 import Gemma4Attention
 from vllm_torchtpu import envs
 from vllm_torchtpu.models.vllm import gemma4_attention_patch as patch
 
+pytestmark = pytest.mark.usefixtures("default_on_knobs_off")
+
 
 class _Rope:
     is_neox_style = True

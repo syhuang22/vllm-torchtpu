@@ -1524,7 +1524,7 @@ def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[i
 
 def _configure_prefill_first_scheduler(vllm_config: VllmConfig) -> None:
     """Install PrefillFirstScheduler when VLLM_TPU_SOLO_PREFILL_OVER_TOKENS is
-    set. Solo prefill steps are a layout the model's programs rely on, so a
+    positive. Solo prefill steps are a layout the model's programs rely on, so a
     different configured scheduler is an error rather than a warning."""
     if not envs.VLLM_TPU_SOLO_PREFILL_OVER_TOKENS:
         return

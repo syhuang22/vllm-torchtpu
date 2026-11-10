@@ -21,12 +21,15 @@ from vllm.model_executor.models import gemma4
 
 from vllm_torchtpu.models.vllm import gemma4_routing_patch
 
+pytestmark = pytest.mark.usefixtures("default_on_knobs_off")
+
 _UPSTREAM = gemma4.gemma4_routing_function_torch
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("num_tokens", [1, 16, 1000])
-def test_matches_upstream_routing(dtype, num_tokens):
+def test_matches_upstream_routing(monkeypatch, dtype, num_tokens):
+    monkeypatch.setattr(gemma4_routing_patch, "_ROUTER_TOPK_KERNEL", False)
     gen = torch.Generator().manual_seed(num_tokens)
     logits = (torch.randn(num_tokens, 128, generator=gen) * 3).to(dtype)
     scale = (torch.rand(128, generator=gen) + 0.5).to(torch.bfloat16)
@@ -71,6 +74,7 @@ def test_router_topk_kernel_branch_matches_the_sort(monkeypatch):
     gen = torch.Generator().manual_seed(7)
     logits = torch.randn(64, 128, generator=gen) * 3
     scale = (torch.rand(128, generator=gen) + 0.5).to(torch.bfloat16)
+    monkeypatch.setattr(gemma4_routing_patch, "_ROUTER_TOPK_KERNEL", False)
     ref_w, ref_ids = gemma4_routing_patch.gemma4_topk_softmax_routing(logits, 8, scale)
     monkeypatch.setattr(gemma4_routing_patch, "_ROUTER_TOPK_KERNEL", True)
     monkeypatch.setattr(gemma4_routing_patch, "_select_scaled", rowmax_select_scaled)
