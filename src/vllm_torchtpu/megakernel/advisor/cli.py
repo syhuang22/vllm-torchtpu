@@ -27,6 +27,7 @@ from ..advisor.models import (
     resolve_model_profile,
 )
 from ..core import errors
+from .calibrate import calibrate_trace
 from .chips import ChipSpec, resolve_chip_spec
 from .regimes import (
     advise_regimes,
@@ -363,10 +364,53 @@ def _resolve_cli_model_and_chip(
     return profile, chip_spec
 
 
+def build_calibrate_arg_parser() -> argparse.ArgumentParser:
+    """Construct the CLI argument parser for the `advisor calibrate` subcommand."""
+    parser = argparse.ArgumentParser(
+        prog="python -m vllm_torchtpu.megakernel.advisor calibrate"
+    )
+    parser.add_argument(
+        "--trace",
+        required=True,
+        type=str,
+        help="Path to .xplane.pb, profile directory, or Perfetto .json/.json.gz",
+    )
+    parser.add_argument(
+        "--out",
+        required=True,
+        type=str,
+        help="Destination path for advisor.measurements.v1 JSON",
+    )
+    parser.add_argument("--chip", type=str, default="tpu7x")
+    parser.add_argument("--model", type=str, default=None)
+    parser.add_argument("--phase", choices=get_args(Phase), default="decode")
+    parser.add_argument("--batch", type=int, default=None)
+    parser.add_argument("--tp", type=int, default=None)
+    return parser
+
+
+def _run_calibrate_cli(argv: Sequence[str]) -> int:
+    """Execute the `advisor calibrate` subcommand."""
+    args = build_calibrate_arg_parser().parse_args(list(argv))
+    calibrate_trace(
+        args.trace,
+        args.out,
+        chip=args.chip,
+        model=args.model,
+        phase=args.phase,
+        batch=args.batch,
+        tp=args.tp,
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the fusion-scope advisor command-line interface."""
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if argv_list and argv_list[0] == "calibrate":
+        return _run_calibrate_cli(argv_list[1:])
     parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv_list)
 
     if args.config and not Path(args.config).is_file():
         msg = f"Missing config file: {args.config!r}"
