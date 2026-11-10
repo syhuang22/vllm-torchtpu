@@ -1794,3 +1794,58 @@ def test_ep_expected_maximum_matches_quadrature() -> None:
     assert solver._ep_z_unit(4) == pytest.approx(_EP_Z_4, rel=1e-12)
     assert solver._ep_z_unit(8) == pytest.approx(_EP_Z_8, rel=1e-12)
     assert solver._ep_z_unit(16) == pytest.approx(_EP_Z_16, rel=1e-12)
+
+
+def test_sweep_matches_main_path_ttft_with_offload() -> None:
+    """Verify crossover sweep produces identical TTFT and throughput to main path."""
+    geom = from_hf_config(QWEN35_CFG)
+    chip = CHIPS["tpu7x"]
+    dt = Dtypes()
+    scen = dc_replace(
+        build_example_scenario("coding-agent"),
+        kv_offload_gb=32.0,
+        prefix_hit_rate=0.5,
+        think_time_s=1.0,
+    )
+    plan = solve_serving_plan(geom, dt, chip, scen, mode="mixed", max_chips=64)
+    ep_pts = [p for p in plan.candidates if p.decode_pool.ep > 1]
+    assert ep_pts, "Expected at least one candidate with ep > 1"
+    pt = ep_pts[0]
+    pools, ctx = solver._setup_crossover_sweep(geom, dt, chip, scen, [pt])
+    state = solver._CandidateState()
+    solver._eval_grid_mix_candidates(scen.prefix_hit_rate, scen, pools[0], ctx, state)
+    entry = state.near_slo[0] if state.near_slo else state.near_all[0]
+    sweep_tput = entry[0]
+    mix_item = pools[0][0]
+    (
+        pt,
+        d_pool,
+        d_pid,
+        b_res,
+        b_res_f,
+        cap_ratio,
+        hbm_ratio,
+        pcie_slope,
+        sf_dec_s,
+        dec_dur_s,
+        draft_s,
+        res_cap,
+        c_srv,
+        conc_f,
+        has_c_gt1,
+        over,
+        inv_chips,
+        neg_chips,
+    ) = mix_item
+    h_eff = min(scen.prefix_hit_rate, cap_ratio)
+    pcie_s = (
+        float(scen.isl)
+        * max(0.0, min(scen.prefix_hit_rate, cap_ratio) - hbm_ratio)
+        * pcie_slope
+        if pcie_slope > 0.0
+        else 0.0
+    )
+    sf_pre_s = ctx.compute_pre_sf(d_pid, d_pool, h_eff)
+    sweep_ttft_ms = (sf_pre_s + pcie_s) * 1e3
+    assert sweep_ttft_ms == pytest.approx(pt.est_ttft_ms, rel=1e-3)
+    assert sweep_tput == pytest.approx(pt.token_throughput_per_chip, rel=0.03)

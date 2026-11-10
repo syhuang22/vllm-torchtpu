@@ -37,6 +37,7 @@ from .geometry import (
     ModelGeometry,
     UnsupportedArchitectureError,
     from_hf_config,
+    layer_ffn_kinds,
     supports,
 )
 from .hf_loader import dtypes_from_hf_config, load_hf_config
@@ -47,6 +48,7 @@ from .modules import (
     StepShape,
     ep_busiest_experts,
     experts_touched,
+    kv_bytes_per_token_per_layer,
     pass_costs,
 )
 from .report import MAX_EMBEDDED_CANDIDATES, render_html, write_html
@@ -118,6 +120,8 @@ __all__ = [
     "ep_busiest_experts",
     "experts_touched",
     "from_hf_config",
+    "kv_bytes_per_token_per_layer",
+    "layer_ffn_kinds",
     "supports",
     "hbm_breakdown_per_core_bytes",
     "hbm_footprint_per_core_bytes",

@@ -23,7 +23,13 @@ from typing import TYPE_CHECKING, Literal
 
 from .chips import TOPOLOGIES, ChipSpec, SliceTopology
 from .collectives import submesh_for_group
-from .modules import Dtypes, Parallel, StepShape
+from .geometry import layer_ffn_kinds
+from .modules import (
+    Dtypes,
+    Parallel,
+    StepShape,
+    kv_bytes_per_token_per_layer,
+)
 from .step import StepFloor, _combine_modules, spec_cycle_floor, step_floor
 
 _STD_NORM = NormalDist()
@@ -595,7 +601,6 @@ def _compute_kv_state_bytes(
     _, _, n_mla, _, n_gdn, n_kda, eff_n_gqa, eff_n_swa, eff_n_mla = counts
     tp = max(1, par.tp)
     pp = max(1, par.pp)
-    kvh = max(1, geom.num_kv_heads // tp) if geom.num_kv_heads > 0 else 0
     if n_mla > 0:
         if geom.kv_lora_rank <= 0:
             msg = "MLA layer requires config field 'kv_lora_rank'"
@@ -603,53 +608,23 @@ def _compute_kv_state_bytes(
         if geom.qk_rope_head_dim < 0:
             msg = "MLA layer requires config field 'qk_rope_head_dim'"
             raise ValueError(msg)
-    raw_latent_w = geom.kv_lora_rank + geom.qk_rope_head_dim
-    gqa_hd = geom.global_head_dim if geom.global_head_dim > 0 else geom.head_dim
-    swa_hd = geom.head_dim
-    if physical_kv_layout:
-        kv_packing = max(
-            1,
-            round(_ROUND_PACKING_NUMERATOR / max(_MIN_PACKING_DIVISOR, dt.kv)),
-        )
-        padded_gqa_hd = math.ceil(gqa_hd / 128) * 128 if gqa_hd > 0 else 0
-        kx2_gqa = kvh if gqa_hd == _HEAD_DIM_64 else 2 * kvh
-        padded_kx2_gqa = (
-            math.ceil(kx2_gqa / kv_packing) * kv_packing if kx2_gqa > 0 else 0
-        )
-        gqa_kv_b_per_tok = float(padded_kx2_gqa * padded_gqa_hd) * dt.kv
-
-        padded_swa_hd = math.ceil(swa_hd / 128) * 128 if swa_hd > 0 else 0
-        kx2_swa = kvh if swa_hd == _HEAD_DIM_64 else 2 * kvh
-        padded_kx2_swa = (
-            math.ceil(kx2_swa / kv_packing) * kv_packing if kx2_swa > 0 else 0
-        )
-        swa_kv_b_per_tok = float(padded_kx2_swa * padded_swa_hd) * dt.kv
-
-        mla_latent_b = float(math.ceil(raw_latent_w / 128) * 128) * dt.kv
-        dsa_idx_b = (
-            float(geom.index_head_dim) * dt.kv
-            + (_BYTE_SCALE_SPARSE_MLA if dt.kv <= 1.0 else 0.0)
-            if (geom.index_topk > 0 and geom.index_head_dim > 0)
-            else 0.0
-        )
-    else:
-        gqa_kv_b_per_tok = float(2 * kvh * gqa_hd) * dt.kv
-        swa_kv_b_per_tok = float(2 * kvh * swa_hd) * dt.kv
-        mla_latent_b = float(raw_latent_w) * dt.kv
-        dsa_idx_b = (
-            float(geom.index_head_dim) * dt.kv
-            if (geom.index_topk > 0 and geom.index_head_dim > 0)
-            else 0.0
-        )
+    gqa_kv_b_per_tok = kv_bytes_per_token_per_layer(
+        geom, dt, par, "gqa", physical=physical_kv_layout
+    )
+    swa_kv_b_per_tok = kv_bytes_per_token_per_layer(
+        geom, dt, par, "swa", physical=physical_kv_layout
+    )
+    mla_dsa_type = "dsa" if (geom.index_topk > 0 and geom.index_head_dim > 0) else "mla"
+    mla_kv_b_per_tok = kv_bytes_per_token_per_layer(
+        geom, dt, par, mla_dsa_type, physical=physical_kv_layout
+    )
     kv_div = par.kv_split * par.pcp * pp
     kv_gqa = float(seqs_per_dp * context) * eff_n_gqa * gqa_kv_b_per_tok / kv_div
     eff_swa_ctx = (
         min(context, geom.sliding_window) if geom.sliding_window > 0 else context
     )
     kv_swa = float(seqs_per_dp * eff_swa_ctx) * eff_n_swa * swa_kv_b_per_tok / kv_div
-    kv_mla = (
-        float(seqs_per_dp * context) * eff_n_mla * (mla_latent_b + dsa_idx_b) / kv_div
-    )
+    kv_mla = float(seqs_per_dp * context) * eff_n_mla * mla_kv_b_per_tok / kv_div
     st_bytes = 0.0
     if n_gdn > 0:
         kh = max(1, geom.linear_k_heads // tp)
@@ -730,9 +705,11 @@ def hbm_footprint_per_core_bytes(
 
 def _floor_times(sf: StepFloor) -> FloorTimes:
     """Decode-step resource times (ms) behind a point's binding unit."""
+    hbm_t = sf.hbm_bound_s if sf.hbm_bound_s > 0.0 else sf.hbm_s
+    mm_t = sf.mm_bound_s if sf.mm_bound_s > 0.0 else sf.mm_s
     return FloorTimes(
-        hbm_ms=sf.hbm_s * 1e3,
-        matmul_ms=sf.mm_s * 1e3,
+        hbm_ms=hbm_t * 1e3,
+        matmul_ms=mm_t * 1e3,
         ici_ms=sf.ici_s * 1e3,
         chain_ms=sf.chain_s * 1e3,
         hop_latency_ms=sf.lat_s * 1e3,
@@ -1033,17 +1010,10 @@ def _pp_layer_prefixes(
     layer_kv: list[float] = []
     layer_st: list[float] = []
     is_full: list[int] = []
+    ffn_kinds = layer_ffn_kinds(geom)
     for idx in range(n_l):
         cr_i = (geom.compress_ratios[idx],) if idx < len(geom.compress_ratios) else ()
-        f_kind = (
-            geom.ffn_kinds[idx]
-            if idx < len(geom.ffn_kinds)
-            else (
-                "moe"
-                if geom.num_experts > 0 and idx >= geom.first_k_dense_replace
-                else "dense"
-            )
-        )
+        f_kind = ffn_kinds[idx] if idx < len(ffn_kinds) else "dense"
         g_i = replace(
             geom,
             num_layers=1,
@@ -1283,6 +1253,31 @@ def _divisors(n: int) -> tuple[int, ...]:
     return tuple(d for d in range(1, n + 1) if n % d == 0)
 
 
+def _candidate_moe_dispatches(
+    moe_mode: str,
+    dp: int,
+) -> list[Literal["allreduce", "ag_ep", "a2a_push"]]:
+    """Return legal MoE dispatch modes for candidate search.
+
+    Runtime selectors outside roofline:
+    - 'allreduce': src/vllm_torchtpu/layers/adapter/custom_ops/moe_runner.py:128
+      (default when USE_MOE_FUSED_EP_KERNEL=0 and
+      ENABLE_PIPELINED_COLLECTIVE_AND_COMPUTE=0)
+    - 'a2a_push': src/vllm_torchtpu/layers/adapter/fused_moe_ep.py:794
+      (USE_MOE_FUSED_EP_KERNEL=1)
+    - 'ag_ep': src/vllm_torchtpu/layers/adapter/pipelined_fused_moe.py:261-301
+      (ENABLE_PIPELINED_COLLECTIVE_AND_COMPUTE=1)
+    - 'fused_rs': src/vllm_torchtpu/platforms/tpu_platform.py:1595 and
+      src/vllm_torchtpu/models/vllm/qwen3_5_patch.py:124-130
+      (TPU_MOE_SEQUENCE_PARALLEL=1 USE_MOE_FUSED_EP_KERNEL=1)
+    """
+    if moe_mode != "ep":
+        return ["allreduce"]
+    if dp == 1:
+        return ["allreduce", "ag_ep", "a2a_push"]
+    return ["ag_ep", "a2a_push"]
+
+
 def _candidate_decode_parallels(
     geom: ModelGeometry,
     topo: SliceTopology,
@@ -1315,23 +1310,16 @@ def _candidate_decode_parallels(
                 int,
                 Literal["allreduce", "ag_ep", "a2a_push"],
             ]
-        ]
-        if moe_mode == "ep" and dp == 1:
-            modes = [
-                ("ep", ep_val, "allreduce"),
-                ("ep", ep_val, "ag_ep"),
-                ("ep", ep_val, "a2a_push"),
-            ]
+        ] = []
+        if moe_mode == "ep":
+            for disp in _candidate_moe_dispatches(moe_mode, dp):
+                modes.append(("ep", ep_val, disp))
             if (
-                geom.moe_inter // tp >= _MIN_MOE_INTERMEDIATE_ALIGNMENT
+                dp == 1
+                and geom.moe_inter // tp >= _MIN_MOE_INTERMEDIATE_ALIGNMENT
                 and (geom.moe_inter // tp) % _MIN_MOE_INTERMEDIATE_ALIGNMENT == 0
             ):
                 modes.append(("tp_slice", 1, "allreduce"))
-        elif moe_mode == "ep":
-            modes = [
-                ("ep", ep_val, "ag_ep"),
-                ("ep", ep_val, "a2a_push"),
-            ]
         else:
             modes = [("tp_slice", 1, "allreduce")]
         for kvs in kv_splits:
@@ -1389,6 +1377,11 @@ def _candidate_prefill_parallels(
                 )
                 ep_val = tp if moe_mode == "ep" else 1
             mesh_ax = submesh_for_group(tp, topo, topo.cores_per_chip)
+            # Runtime selectors:
+            # - 'allreduce':
+            #   src/vllm_torchtpu/layers/adapter/custom_ops/moe_runner.py:128
+            # - 'ag_ep':
+            #   src/vllm_torchtpu/layers/adapter/pipelined_fused_moe.py:261-301
             dispatches: tuple[Literal["allreduce", "ag_ep"], ...] = (
                 ("ag_ep",)
                 if (moe_mode == "ep" and tp == 1)
@@ -1899,13 +1892,23 @@ def _evaluate_mixed_candidates(
                 ctx.ctx_full,
             )
             per_seq_b = hbm_c1 - w_base_b
+            pre_chunk_rows = min(ctx.eff_isl, ctx.scenario.prefill_chunk)
+            logit_peak_mix_b = _peak_prefill_logit_bytes(
+                ctx.geom,
+                ctx.dtypes,
+                par,
+                pre_chunk_rows,
+                sampled_rows=1 * max(1, ctx.spec_k + 1),
+            )
             b_hbm_max = (
                 int((ctx.hbm_limit_b - w_base_b) // per_seq_b)
-                if (hbm_c1 <= ctx.hbm_limit_b and per_seq_b > 0.0)
-                else (ctx.c_max if hbm_c1 <= ctx.hbm_limit_b else 0)
+                if ((hbm_c1 + logit_peak_mix_b) <= ctx.hbm_limit_b and per_seq_b > 0.0)
+                else (
+                    ctx.c_max if (hbm_c1 + logit_peak_mix_b) <= ctx.hbm_limit_b else 0
+                )
             )
             b_smem_max = _smem_max_seqs(ctx.ctx_full, par.kv_split, ctx.page_size)
-            if hbm_c1 <= ctx.hbm_limit_b and b_smem_max >= 1:
+            if (hbm_c1 + logit_peak_mix_b) <= ctx.hbm_limit_b and b_smem_max >= 1:
                 sf_c1 = (
                     spec_cycle_floor(
                         ctx.geom,
@@ -2336,7 +2339,7 @@ def _search_disagg_instance_ratios(
 ) -> list[ParetoPoint]:
     """Search instance multiplier ratios (x_p, y_d) for one prefill-decode pair."""
     dec_steps_per_req = max(1.0, ctx.scenario.osl / ctx.eff_al)
-    b_one = math.ceil(c / max(1, dec.par.dp))
+    b_one = max(1, min(math.ceil(c / max(1, dec.par.dp)), dec.b_hbm_max))
     sf_d_one = (
         spec_cycle_floor(
             ctx.geom,
@@ -3104,6 +3107,7 @@ def _eval_grid_mix_candidates(
         b_res,
         b_res_f,
         cap_ratio,
+        hbm_ratio,
         pcie_slope,
         sf_dec_s,
         dec_dur_s,
@@ -3121,11 +3125,15 @@ def _eval_grid_mix_candidates(
             n_chk = n_chk_1
             chunk_tok_c = chunk_tok_1
         else:
-            h_eff = h * cap_ratio
+            h_eff = min(h, cap_ratio)
             eff_isl_h = max(1, math.ceil((1.0 - h_eff) * scen.isl))
             n_chk = max(1, math.ceil(eff_isl_h / ctx.prefill_chunk))
             chunk_tok_c = min(ctx.prefill_chunk, eff_isl_h)
-        pcie_s = h * pcie_slope if pcie_slope > 0.0 else 0.0
+        pcie_s = (
+            float(scen.isl) * max(0.0, min(h, cap_ratio) - hbm_ratio) * pcie_slope
+            if pcie_slope > 0.0
+            else 0.0
+        )
         sf_mix_s = ctx.mix_cache.get((d_pid, b_res, chunk_tok_c))
         if sf_mix_s is None:
             sf_mix_s = ctx.compute_mix_sf(d_pid, b_res, chunk_tok_c)
@@ -3149,7 +3157,7 @@ def _eval_grid_mix_candidates(
         est_step_s = (1.0 - p_mix) * sf_dec_s + p_mix * mix_serial_s
         tpot_h = est_step_s * ctx.inv_al_ms
         inter_h = 1000.0 / max(1e-06, tpot_h)
-        tput = rate_s * inv_chips
+        tput = rate_s * float(scen.isl + scen.osl) * inv_chips
         slo_ok = (ctx.ttft_slo is None or ttft_h <= ctx.ttft_slo) and (
             ctx.tpot_slo is None or tpot_h <= ctx.tpot_slo
         )
@@ -3167,18 +3175,19 @@ def _eval_grid_disagg_fast(
     dis_fast_groups: dict,
     ctx: _GridEvalContext,
     state: _CandidateState,
+    scen: TrafficScenario,
 ) -> None:
     """Evaluate fast disaggregated candidate throughput and latency under hit rate h."""
     tol_band = 1.0 + 1e-7
     for (p_pid, cap_ratio), (p_pool, grp_f) in dis_fast_groups.items():
-        h_eff = h if (cap_ratio == 1.0 or h == 0.0) else h * cap_ratio
+        h_eff = min(h, cap_ratio) if (cap_ratio < 1.0 and h > 0.0) else h
         sf_pre_s = ctx.pre_cache.get((p_pid, h_eff))
         if sf_pre_s is None:
             sf_pre_s = ctx.compute_pre_sf(p_pid, p_pool, h_eff)
         denom_pre = max(1e-09, sf_pre_s)
         for p_inst_f, rate_d, inv_chips, tpot_ok, inter_d, neg_chips, pt in grp_f:
             rate_p = p_inst_f / denom_pre
-            tput = min(rate_p, rate_d) * inv_chips
+            tput = min(rate_p, rate_d) * float(scen.isl + scen.osl) * inv_chips
             if tpot_ok:
                 if tput * tol_band >= state.max_slo:
                     state.max_slo = max(state.max_slo, tput)
@@ -3207,7 +3216,7 @@ def _eval_grid_disagg_ttft(
             n_chk = n_chk_1
             wire_b_h = wire_b_1
         else:
-            h_eff = h * cap_ratio
+            h_eff = min(h, cap_ratio)
             eff_isl_h = max(1, math.ceil((1.0 - h_eff) * scen.isl))
             n_chk = max(1, math.ceil(eff_isl_h / ctx.prefill_chunk))
             wire_b_h = ctx.get_wire_b(eff_isl_h) if ctx.need_wire else 0.0
@@ -3226,6 +3235,7 @@ def _eval_grid_disagg_ttft(
             inter_d,
             neg_chips,
             pcie_slope,
+            hbm_ratio,
             inv_min_c_dcn_ms,
             q_wait_d_ms,
             dec_dur_s,
@@ -3234,7 +3244,11 @@ def _eval_grid_disagg_ttft(
         ) in grp_t:
             rate_p = p_inst_f / denom_pre
             coupled_cap = min(rate_p, rate_d)
-            pcie_s = h * pcie_slope if pcie_slope > 0.0 else 0.0
+            pcie_s = (
+                float(scen.isl) * max(0.0, min(h, cap_ratio) - hbm_ratio) * pcie_slope
+                if pcie_slope > 0.0
+                else 0.0
+            )
             xfer_ms = wire_b_h * inv_min_c_dcn_ms
             ttft_h = pre_bub_ms + pcie_s * 1e3 + xfer_ms + q_wait_d_ms
             if ctx.has_think:
@@ -3243,7 +3257,7 @@ def _eval_grid_disagg_ttft(
                 coupled = min(coupled_cap, c_rate_d)
             else:
                 coupled = coupled_cap
-            tput = coupled * inv_chips
+            tput = coupled * float(scen.isl + scen.osl) * inv_chips
             slo_ok = tpot_ok and (ctx.ttft_slo is None or ttft_h <= ctx.ttft_slo)
             if slo_ok:
                 if tput * tol_band >= state.max_slo:
@@ -3265,7 +3279,7 @@ def _eval_grid_h(
     state = _CandidateState()
     _eval_grid_mix_candidates(h, scen, mix_meta, ctx, state)
     if not ctx.need_ttft:
-        _eval_grid_disagg_fast(h, dis_fast_groups, ctx, state)
+        _eval_grid_disagg_fast(h, dis_fast_groups, ctx, state, scen)
     else:
         _eval_grid_disagg_ttft(h, scen, dis_ttft_groups, ctx, state)
     tol_band = 1.0 + 1e-7
@@ -3326,7 +3340,9 @@ def _setup_crossover_mixed_cand(
     b_local = max(1, math.ceil(pt.concurrency / max(1, d_idp)))
     b_res = d_pool.max_num_seqs if d_pool.max_num_seqs is not None else b_local
     get_b_kv, get_dec_sf = helpers
-    cap_ratio, _, pcie_k = _calc_sweep_kv_ratios(pt, scen, b_local, d_pool, get_b_kv)
+    cap_ratio, hbm_ratio, pcie_k = _calc_sweep_kv_ratios(
+        pt, scen, b_local, d_pool, get_b_kv
+    )
     pcie_slope = 0.0
     if pcie_k > 0.0 and chip.pcie_bw > 0.0 and math.isfinite(chip.pcie_bw):
         pcie_core_bw = chip.pcie_bw / float(max(1, chip.cores_per_chip))
@@ -3352,6 +3368,7 @@ def _setup_crossover_mixed_cand(
             b_res,
             float(b_res),
             cap_ratio,
+            hbm_ratio,
             pcie_slope,
             sf_dec_s,
             dec_dur_s,
@@ -3387,7 +3404,9 @@ def _setup_crossover_disagg_cand(
     b_res = d_pool.max_num_seqs if d_pool.max_num_seqs is not None else b_local
     get_b_kv, get_dec_sf, get_pool_id = helpers
     p_pid = get_pool_id(p_pool)
-    cap_ratio, _, pcie_k = _calc_sweep_kv_ratios(pt, scen, b_local, d_pool, get_b_kv)
+    cap_ratio, hbm_ratio, pcie_k = _calc_sweep_kv_ratios(
+        pt, scen, b_local, d_pool, get_b_kv
+    )
     pcie_slope = 0.0
     if pcie_k > 0.0 and chip.pcie_bw > 0.0 and math.isfinite(chip.pcie_bw):
         pcie_core_bw = chip.pcie_bw / float(max(1, chip.cores_per_chip))
@@ -3433,6 +3452,7 @@ def _setup_crossover_disagg_cand(
                 inter_d,
                 -pt.total_chips,
                 pcie_slope,
+                hbm_ratio,
                 inv_min_c_dcn_ms,
                 q_wait_d_ms,
                 dec_dur_s,
@@ -3603,8 +3623,6 @@ class _CrossoverPlanner:
             sf_obj = step_floor(
                 self.geom, self.chip, par, shape, dtypes=self.dtypes, topology=topo
             )
-            if par.ep > 1:
-                sf_obj = _scale_ep_moe_floor(sf_obj, self.chip, self.geom, par, eff_pre)
             if par.pp > 1:
                 sf_obj = _scale_pp_stage_floor(sf_obj, pp_part, self.chip, par, topo)
             sf_s = sf_obj.serial_estimate_s

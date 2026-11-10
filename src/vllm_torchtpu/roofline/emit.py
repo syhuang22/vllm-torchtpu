@@ -38,7 +38,20 @@ def pool_cli_args(
     spec_tokens: int = 0,
     mtp_layers: int = 0,
 ) -> list[str]:
-    """Translate one ``PoolMeshPlan`` into ``vllm serve`` CLI flags."""
+    """Translate one ``PoolMeshPlan`` into ``vllm serve`` CLI flags.
+
+    Runtime selectors for MoE dispatch modes outside roofline:
+    - 'allreduce': src/vllm_torchtpu/layers/adapter/custom_ops/moe_runner.py:128
+      (default when USE_MOE_FUSED_EP_KERNEL=0 and
+      ENABLE_PIPELINED_COLLECTIVE_AND_COMPUTE=0)
+    - 'a2a_push': src/vllm_torchtpu/layers/adapter/fused_moe_ep.py:794
+      (USE_MOE_FUSED_EP_KERNEL=1)
+    - 'ag_ep': src/vllm_torchtpu/layers/adapter/pipelined_fused_moe.py:261-301
+      (ENABLE_PIPELINED_COLLECTIVE_AND_COMPUTE=1)
+    - 'fused_rs': src/vllm_torchtpu/platforms/tpu_platform.py:1595 and
+      src/vllm_torchtpu/models/vllm/qwen3_5_patch.py:124-130
+      (TPU_MOE_SEQUENCE_PARALLEL=1 USE_MOE_FUSED_EP_KERNEL=1)
+    """
     args = [
         "--tensor-parallel-size",
         str(pool.tp),
@@ -85,8 +98,23 @@ def _format_server_cmd(
     prefix = f"vllm serve {model}" if model else "vllm serve"
     cmd = f"{prefix} {joined}".strip()
     env_parts: list[str] = []
-    if moe_dispatch in ("a2a_push", "fused_rs"):
+    # Runtime selectors outside roofline:
+    # - 'allreduce': src/vllm_torchtpu/layers/adapter/custom_ops/moe_runner.py:128
+    #   (default when USE_MOE_FUSED_EP_KERNEL=0 and
+    #   ENABLE_PIPELINED_COLLECTIVE_AND_COMPUTE=0)
+    # - 'a2a_push': src/vllm_torchtpu/layers/adapter/fused_moe_ep.py:794
+    #   (USE_MOE_FUSED_EP_KERNEL=1)
+    # - 'ag_ep': src/vllm_torchtpu/layers/adapter/pipelined_fused_moe.py:261-301
+    #   (ENABLE_PIPELINED_COLLECTIVE_AND_COMPUTE=1)
+    # - 'fused_rs': src/vllm_torchtpu/platforms/tpu_platform.py:1595 and
+    #   src/vllm_torchtpu/models/vllm/qwen3_5_patch.py:124-130
+    #   (TPU_MOE_SEQUENCE_PARALLEL=1 USE_MOE_FUSED_EP_KERNEL=1)
+    if moe_dispatch == "a2a_push":
         env_parts.append("USE_MOE_FUSED_EP_KERNEL=1")
+    elif moe_dispatch == "ag_ep":
+        env_parts.append("ENABLE_PIPELINED_COLLECTIVE_AND_COMPUTE=1")
+    elif moe_dispatch == "fused_rs":
+        env_parts.append("TPU_MOE_SEQUENCE_PARALLEL=1 USE_MOE_FUSED_EP_KERNEL=1")
     if pp_layer_partition is not None and len(set(pp_layer_partition)) > 1:
         part_str = ",".join(str(x) for x in pp_layer_partition)
         env_parts.append(f"VLLM_PP_LAYER_PARTITION={part_str}")

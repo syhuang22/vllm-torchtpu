@@ -157,8 +157,12 @@ def test_cli_plan_axes_flags(
     )
     assert rc == 0
     mods = json.loads(capsys.readouterr().out)
-    total = sum(m["hbm_bytes"] for m in mods)
-    assert total == pytest.approx(4_476_803_544.77, abs=1.0)
+    total_phys = sum(m["hbm_bytes"] for m in mods)
+    assert total_phys == pytest.approx(5_168_280_024.77, abs=1.0)
+    gqa_mod = next(m for m in mods if m["name"] == "gqa")
+    assert gqa_mod.get("hbm_bytes_min") is not None
+    logical_total = total_phys - (gqa_mod["hbm_bytes"] - gqa_mod["hbm_bytes_min"])
+    assert logical_total == pytest.approx(4_476_803_544.77, abs=1.0)
 
 
 def test_plan_requires_acceptance_length_for_spec_window(tmp_path: Path) -> None:
