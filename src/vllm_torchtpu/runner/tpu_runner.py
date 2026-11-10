@@ -960,8 +960,7 @@ class TPUModelRunner(GPUModelRunner):
         # Compile bucket + padding (TPU AOT compile rounds inputs up).
         self.sliding_window = self.model_config.get_sliding_window()
         self.block_size = cache_config.block_size
-        most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
-        self.most_model_len = most_model_len
+        self.most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
         self._fast_token_substitution: bool = bool(
             envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
         )
@@ -984,8 +983,8 @@ class TPUModelRunner(GPUModelRunner):
             except (IndexError, TypeError, AttributeError, KeyError):
                 pass
         self.num_blocks_per_most_len_req = (
-            cdiv(most_model_len, self.block_size)
-            if most_model_len is not None
+            cdiv(self.most_model_len, self.block_size)
+            if self.most_model_len is not None
             else None
         )
         # InputBatch needs to work with sampling tensors greater than padding
