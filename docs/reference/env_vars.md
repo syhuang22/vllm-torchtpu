@@ -21,7 +21,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TORCH_TPU_MP_RENDEZVOUS_PORT` | `None` | Optional explicit TCP port for multi-host `mp` `TCPStore` rendezvous. |
 | `TPU_ACCELERATOR_TYPE` | `None` | Explicit accelerator type override (e.g., `"tpu7x"`, `"v6e-8"`) when running offline compilation or CPU tests. |
 | `TPU_LIBRARY_PATH` | `None` | `libtpu.so` loaded by the TPU runtime. `import libtpu` sets it to the pip package's own library. A custom path (any other file) takes precedence over an installed `libtpu` package: a fingerprint of that file replaces the package version in the compile and Raiden layout cache keys, and the minimum libtpu version check is skipped. |
-| `TPU_NORM_WEIGHTS_FP32` | `False` | Opt-in. Stores learned `RMSNorm` weights in float32 at load time, avoiding a per-norm weight conversion op on every step when norms run through the TPU `rms_norm` providers. |
+| `TPU_NORM_WEIGHTS_FP32` | `True` | Stores learned `RMSNorm` weights in float32 at load time, avoiding a per-norm weight conversion op on every step when norms run through the TPU `rms_norm` providers. |
 
 ---
 
@@ -44,7 +44,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
 | `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
-| `TPU_GEMMA4_SEQUENCE_PARALLEL` | `False` | Opt-in. Keeps the Gemma 4 residual stream sharded across TP ranks on prefill token buckets whose per-rank shard is at least 1 MiB, overlapping two microbatches when each half-chunk remains at least 1 MiB per rank. |
+| `TPU_GEMMA4_SEQUENCE_PARALLEL` | `True` | Requires TP > 1. Keeps the Gemma 4 residual stream sharded across TP ranks on prefill token buckets whose per-rank shard is at least 1 MiB, overlapping two microbatches when each half-chunk remains at least 1 MiB per rank. |
 | `TPU_GEMMA4_CP_MIN_TOKENS` | `0` | Opt-in (`0` disables). Runs Gemma 4 token buckets of at least this many tokens with zigzag context-parallel prefill across the TP group (requires `TP >= 3`, prefix caching disabled, and `VLLM_TPU_SOLO_PREFILL_OVER_TOKENS` whose bucket sits immediately below this threshold). |
 
 ---
@@ -93,7 +93,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
-| `TPU_FP8_ATTENTION` | `False` | Enables opt-in FP8 `e4m3fn` QK and PV matmul compute for eligible Ragged Paged Attention prefill tiles on TPUs with native FP8 acceleration. |
+| `TPU_FP8_ATTENTION` | `True` | Enables FP8 `e4m3fn` QK and PV matmul compute for eligible Ragged Paged Attention prefill tiles on TPUs with native FP8 acceleration. |
 
 ---
 

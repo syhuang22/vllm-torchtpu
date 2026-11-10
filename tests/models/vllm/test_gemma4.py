@@ -495,6 +495,8 @@ def test_maybe_patch_gemma4_filters_model_type_and_is_idempotent(monkeypatch):
         hf_text_config=SimpleNamespace(model_type="gemma4_text"),
     )
     monkeypatch.setattr(gemma4_patch, "gemma4_mod", fake_mod)
+    # Keep the sequence-parallel patch out of the shared vLLM classes.
+    monkeypatch.setenv("TPU_GEMMA4_SEQUENCE_PARALLEL", "0")
     assert gemma4_patch.maybe_patch_gemma4(gemma_cfg) is None
     mlp_fwd = Gemma4MLP.forward
     attn_fwd = Gemma4Attention.forward
