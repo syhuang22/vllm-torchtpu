@@ -545,7 +545,6 @@ configure_role_environment() {
   export TPU_PREMAPPED_BUFFER_SIZE="${TPU_PREMAPPED_BUFFER_SIZE:-17179869184}"
 
   export TPU_P2P_WAIT_PULL_TIMEOUT=600
-  export TPU_KV_SHM_POOL_GB=8
   export TPU_KV_TRANSFER_PORT="${transfer_port}"
   export TPU_SIDE_CHANNEL_PORT="${side_channel_port}"
 

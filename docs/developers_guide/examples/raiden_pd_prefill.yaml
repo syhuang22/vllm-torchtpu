@@ -191,8 +191,6 @@ spec:
           value: "64"
         - name: TPU_P2P_WAIT_PULL_TIMEOUT
           value: "600"
-        - name: TPU_KV_SHM_POOL_GB
-          value: "8"
         - name: TPU_KV_TRANSFER_PORT
           value: "9100"
         - name: TPU_SIDE_CHANNEL_PORT

@@ -161,7 +161,6 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
 # prefix-aware load, so a decode-side hit shares pages Raiden would write over.
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-0}"
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-0}"
-TPU_KV_SHM_POOL_GB="${TPU_KV_SHM_POOL_GB:-8}"
 TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-1}"
 RESTART_EXISTING="${RESTART_EXISTING:-1}"
 # A full DSv4 boot is roughly 27 minutes of weight load plus compile.
@@ -444,7 +443,6 @@ common_env_exports=(
   "export TPU_HMA_MAX_INFLIGHT_PULLS=8"
   "export TPU_MAX_HOST_KV_BUFFER_SIZE=64"
   "export TPU_P2P_WAIT_PULL_TIMEOUT=300"
-  "export TPU_KV_SHM_POOL_GB=${TPU_KV_SHM_POOL_GB}"
   "export TPU_SIDE_CHANNEL_PORT=${TPU_SIDE_CHANNEL_PORT}"
   "export VLLM_ENGINE_READY_TIMEOUT_S=${VLLM_ENGINE_READY_TIMEOUT_S:-2700}"
   "export LIBTPU_INIT_ARGS=\"\${LIBTPU_INIT_ARGS:-} --xla_tpu_scoped_vmem_limit_kib=65536\""
