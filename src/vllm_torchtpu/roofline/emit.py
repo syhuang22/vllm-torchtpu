@@ -335,7 +335,7 @@ def build_solve_payload(
             "modeled estimates, bound_* values are physical lower bounds"
         ),
     }
-    chip_dict = asdict(chip)
+    chip_dict: dict[str, Any] = dict(asdict(chip))
     chip_dict["jax_version"] = JAX_VERSION
     chip_dict["catalog"] = chip_catalog(chip)
     payload["chip_spec"] = chip_dict

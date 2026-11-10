@@ -2520,7 +2520,11 @@ def solve_serving_plan(
         else DEFAULT_GPU_MEMORY_UTILIZATION
     )
     hbm_reserve_val = kwargs.get("hbm_reserve_gb", hbm_reserve_gb)
-    eff_hbm_reserve_gb = float(hbm_reserve_val) if hbm_reserve_val is not None else 0.0
+    eff_hbm_reserve_gb = (
+        float(hbm_reserve_val)
+        if isinstance(hbm_reserve_val, (int, float, str))
+        else 0.0
+    )
 
     if not (0.0 < gpu_memory_utilization <= 1.0):
         msg = f"gpu_memory_utilization must be in (0, 1], got {gpu_memory_utilization}"

@@ -652,18 +652,25 @@ def _render_assumptions_card(payload: dict[str, Any]) -> list[str]:
     if type(cat) is not dict:
         cat = chip_catalog(CHIPS["tpu7x"])
     gmu = float(payload.get("gpu_memory_utilization") or 0.92)
-    hbm_gb = float(chip_spec.get("hbm_bytes", 103_000_000_000)) / 1e9
+
+    def _fval(v: object, default: float) -> float:
+        return float(v) if isinstance(v, (int, float, str)) else default
+
+    def _ival(v: object, default: int) -> int:
+        return int(v) if isinstance(v, (int, float, str)) else default
+
+    hbm_gb = _fval(chip_spec.get("hbm_bytes"), 103_000_000_000.0) / 1e9
     usable_gb = hbm_gb * gmu
-    hbm_bw_tb = float(chip_spec.get("hbm_bw", 3.70e12)) / 1e12
-    bf16_pf = float(chip_spec.get("bf16_flops", 1.155e15)) / 1e15
-    fp8_pf = float(chip_spec.get("fp8_flops", 2.30e15)) / 1e15
-    m_tile = int(chip_spec.get("mxu_m_tile", 256))
-    link_gb = float(chip_spec.get("ici_link_bw", 100.0e9)) / 1e9
-    core_ici_gb = float(chip_spec.get("ici_bw", 300.0e9)) / 1e9
-    d2d_gb = float(chip_spec.get("d2d_bw", 600.0e9)) / 1e9
-    hop_us = float(chip_spec.get("ici_hop_latency_s", 1.0e-6)) * 1e6
-    dcn_gb = float(chip_spec.get("dcn_bw", 12.5e9)) / 1e9
-    pcie_gb = float(chip_spec.get("pcie_bw", 64.0e9)) / 1e9
+    hbm_bw_tb = _fval(chip_spec.get("hbm_bw"), 3.70e12) / 1e12
+    bf16_pf = _fval(chip_spec.get("bf16_flops"), 1.155e15) / 1e15
+    fp8_pf = _fval(chip_spec.get("fp8_flops"), 2.30e15) / 1e15
+    m_tile = _ival(chip_spec.get("mxu_m_tile"), 256)
+    link_gb = _fval(chip_spec.get("ici_link_bw"), 100.0e9) / 1e9
+    core_ici_gb = _fval(chip_spec.get("ici_bw"), 300.0e9) / 1e9
+    d2d_gb = _fval(chip_spec.get("d2d_bw"), 600.0e9) / 1e9
+    hop_us = _fval(chip_spec.get("ici_hop_latency_s"), 1.0e-6) * 1e6
+    dcn_gb = _fval(chip_spec.get("dcn_bw"), 12.5e9) / 1e9
+    pcie_gb = _fval(chip_spec.get("pcie_bw"), 64.0e9) / 1e9
     cat_items: list[str] = []
     for k, entry in cat.items():
         if type(entry) is not dict:
@@ -705,7 +712,7 @@ def _render_assumptions_card(payload: dict[str, Any]) -> list[str]:
         "(<code>8 ~ 15 GB/core</code>), "
         "and trace-level LRU cache eviction or arrival burstiness.</li>",
         "    </ul>",
-        "    <details><summary>Constants Catalog "
+        "    <details open><summary>Constants Catalog "
         "(fact / derived / assumed / config)</summary>",
         "    <ul>",
         *[f"      {item}" for item in cat_items],
