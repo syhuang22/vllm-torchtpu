@@ -50,6 +50,12 @@ if TYPE_CHECKING:
         resolve_model_profile,
         supports_hf_config,
     )
+    from ..advisor.roofline import (
+        validate_workload,
+    )
+    from ..advisor.spec_bridge import (
+        advise_from_spec,
+    )
     from ..advisor.specs import (
         BUCKET_CONSUMER_STATUS,
         BUCKET_SCHEDULE_SCHEMA,
@@ -77,13 +83,33 @@ if TYPE_CHECKING:
         default_double_buffer_ring_plan,
         load_measurements,
     )
+    from ..advisor.support import (
+        CORE_LIMITS,
+        CoreLimits,
+        evaluate_support,
+    )
+    from ..advisor.verdict import (
+        advise,
+        compute_scope_raw_step_us,
+    )
+    from ..advisor.vmem import (
+        compute_all_reduce_transfer_cost,
+        compute_per_token_vmem_bytes,
+        fit_vmem_budget_bytes,
+        validate_advise_inputs,
+    )
 
 _SUBMODULES = frozenset(
     {
         "chips",
         "jax_bridge",
         "models",
+        "roofline",
+        "spec_bridge",
         "specs",
+        "support",
+        "verdict",
+        "vmem",
     }
 )
 
@@ -117,6 +143,10 @@ _LAZY = {
     "resolve_hf_snapshot_config": ".models",
     "resolve_model_profile": ".models",
     "supports_hf_config": ".models",
+    # roofline
+    "validate_workload": ".roofline",
+    # spec_bridge
+    "advise_from_spec": ".spec_bridge",
     # specs
     "AdvisorReport": ".specs",
     "AdvisorSweepReport": ".specs",
@@ -143,6 +173,18 @@ _LAZY = {
     "WorkloadSpec": ".specs",
     "default_double_buffer_ring_plan": ".specs",
     "load_measurements": ".specs",
+    # support
+    "CORE_LIMITS": ".support",
+    "CoreLimits": ".support",
+    "evaluate_support": ".support",
+    # verdict
+    "advise": ".verdict",
+    "compute_scope_raw_step_us": ".verdict",
+    # vmem
+    "compute_all_reduce_transfer_cost": ".vmem",
+    "compute_per_token_vmem_bytes": ".vmem",
+    "fit_vmem_budget_bytes": ".vmem",
+    "validate_advise_inputs": ".vmem",
 }
 
 
@@ -171,6 +213,7 @@ __all__ = [
     "BUCKET_CONSUMER_STATUS",
     "BUCKET_SCHEDULE_SCHEMA",
     "BUILTIN_CHIP_SPECS",
+    "CORE_LIMITS",
     "DEPLOYMENT_PRESETS",
     "DEPLOYMENT_PRESET_SOURCES",
     "MODEL_PRESETS",
@@ -187,6 +230,7 @@ __all__ = [
     "BucketSchedulePayload",
     "BucketScheduleRule",
     "ChipSpec",
+    "CoreLimits",
     "DeploymentPreset",
     "DisaggHandoffSpec",
     "DispatchRegime",
@@ -208,8 +252,15 @@ __all__ = [
     "SupportStatus",
     "UnsupportedArchitectureError",
     "WorkloadSpec",
+    "advise",
+    "advise_from_spec",
+    "compute_all_reduce_transfer_cost",
+    "compute_per_token_vmem_bytes",
+    "compute_scope_raw_step_us",
     "default_double_buffer_ring_plan",
     "detect_tpu_from_sysfs",
+    "evaluate_support",
+    "fit_vmem_budget_bytes",
     "load_chip_spec_file",
     "load_measurements",
     "load_public_calibration",
@@ -219,5 +270,7 @@ __all__ = [
     "resolve_hf_snapshot_config",
     "resolve_model_profile",
     "supports_hf_config",
+    "validate_advise_inputs",
+    "validate_workload",
     "verify_chip_spec_against_jax",
 ]
