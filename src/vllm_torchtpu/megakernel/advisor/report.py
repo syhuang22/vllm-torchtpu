@@ -31,6 +31,11 @@ from .specs import (
     BucketSchedulePayload,
     BucketScheduleRule,
 )
+from .workbench import (
+    render_workbench_body,
+    render_workbench_css,
+    render_workbench_script,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -1266,9 +1271,20 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
         f"{sweep.vmem_static_mib:.1f} / {sweep.vmem_budget_mib:.1f} MiB "
         f"({sweep.dma_buffers}-slot DMA)"
     )
-    wb_css = ""
-    wb_body = ""
-    wb_js = ""
+    c_spec = sweep.chip_spec
+    vmem_max_mib = (
+        round(c_spec.vmem_usable_bytes / (1 << 20), 1) if c_spec is not None else 62.0
+    )
+    vmem_init_mib = min(round(sweep.vmem_budget_mib, 1), vmem_max_mib)
+    wb_css = render_workbench_css()
+    wb_body = render_workbench_body(
+        model_name=sweep.model,
+        chip_name=sweep.chip,
+        layout_label=rec.label(),
+        mode_source=mode_src,
+        vmem_bounds_mib=(vmem_init_mib, vmem_max_mib),
+    )
+    wb_js = render_workbench_script()
     return f"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
