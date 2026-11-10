@@ -64,12 +64,14 @@ if TYPE_CHECKING:
         recommend_parallelism,
     )
     from ..advisor.report import (
+        build_bucket_schedule,
         format_advisor_summary,
         format_regime_table,
         render_advisor_html,
         render_regime_dot_plot_svg,
         svg_text_width,
         write_advisor_html,
+        write_bucket_schedule,
     )
     from ..advisor.roofline import (
         validate_workload,
@@ -180,12 +182,14 @@ _LAZY = {
     "primary_step_mode": ".regimes",
     "recommend_parallelism": ".regimes",
     # report
+    "build_bucket_schedule": ".report",
     "format_advisor_summary": ".report",
     "format_regime_table": ".report",
     "render_advisor_html": ".report",
     "render_regime_dot_plot_svg": ".report",
     "svg_text_width": ".report",
     "write_advisor_html": ".report",
+    "write_bucket_schedule": ".report",
     # roofline
     "validate_workload": ".roofline",
     # spec_bridge
@@ -299,6 +303,7 @@ __all__ = [
     "advise_from_spec",
     "advise_regimes",
     "build_arg_parser",
+    "build_bucket_schedule",
     "calibrate_trace",
     "compare_parallelism_candidates",
     "compute_all_reduce_transfer_cost",
@@ -329,4 +334,5 @@ __all__ = [
     "validate_workload",
     "verify_chip_spec_against_jax",
     "write_advisor_html",
+    "write_bucket_schedule",
 ]
