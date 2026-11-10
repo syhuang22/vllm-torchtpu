@@ -271,7 +271,7 @@ _FALLBACK_TPU_SPECS: dict[str, tuple[int, float, float, float, int]] = {
 }
 
 
-def from_jax(  # noqa: PLR0913
+def from_jax(
     name: str,
     version: object,
     *,
