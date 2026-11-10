@@ -55,6 +55,10 @@ def _resolve_cached_or_local_config(raw_str: str) -> dict[str, Any] | str:
     if p.is_dir() and (p / "config.json").is_file():
         return dict(json.loads((p / "config.json").read_text()))
 
+    if p.is_absolute() or raw_str.endswith(".json") or raw_str.startswith((".", "/")):
+        msg = f"Could not resolve HF config path: {raw_str}"
+        raise FileNotFoundError(msg)
+
     if "/" in raw_str and not raw_str.startswith(("http://", "https://")):
         org_repo = raw_str.strip("/").replace("/", "--")
         hf_home = Path(envs.HF_HOME or (Path.home() / ".cache" / "huggingface"))
@@ -89,19 +93,23 @@ def _fetch_remote_hf_config(url: str, token: str) -> dict[str, Any]:
     is_https = parsed_url.scheme == "https"
     port = parsed_url.port or (443 if is_https else 80)
     conn_cls = http.client.HTTPSConnection if is_https else http.client.HTTPConnection
-    conn = conn_cls(parsed_url.hostname, port=port, timeout=15)
-    path = parsed_url.path or "/"
-    if parsed_url.query:
-        path = f"{path}?{parsed_url.query}"
-    conn.request("GET", path, headers=headers)
-    resp = conn.getresponse()
-    if resp.status != _HTTP_OK:
-        msg = f"HTTP {resp.status} fetching HF config from {url}"
+    try:
+        conn = conn_cls(parsed_url.hostname, port=port, timeout=10.0)
+        path = parsed_url.path or "/"
+        if parsed_url.query:
+            path = f"{path}?{parsed_url.query}"
+        conn.request("GET", path, headers=headers)
+        resp = conn.getresponse()
+        if resp.status != _HTTP_OK:
+            msg = f"HTTP {resp.status} fetching HF config from {url}"
+            conn.close()
+            raise FileNotFoundError(msg)
+        data = resp.read()
         conn.close()
-        raise FileNotFoundError(msg)
-    data = resp.read()
-    conn.close()
-    return dict(json.loads(data.decode("utf-8")))
+        return dict(json.loads(data.decode("utf-8")))
+    except (TimeoutError, OSError) as exc:
+        msg = f"Network timeout or error fetching HF config from {url}: {exc}"
+        raise RuntimeError(msg) from exc
 
 
 def load_hf_config(

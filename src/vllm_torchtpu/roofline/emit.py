@@ -223,9 +223,23 @@ def point_launch_args(
             pp_layer_partition=p_pool.pp_layer_partition,
             moe_dispatch=p_pool.moe_dispatch,
         )
+        p_chips = p_pool.instances * p_pool.chips_per_instance
+        d_chips = d_pool.instances * d_pool.chips_per_instance
         commands = [
-            f"# prefill ({p_pool.instances}x {p_pool.topology}): {prefill_cmd}",
-            f"# decode ({d_pool.instances}x {d_pool.topology}): {decode_cmd}",
+            (
+                f"# provision: prefill {p_pool.instances}x {p_pool.topology} "
+                f"({p_chips} chips)"
+            ),
+            prefill_cmd,
+            (
+                f"# provision: decode {d_pool.instances}x {d_pool.topology} "
+                f"({d_chips} chips)"
+            ),
+            decode_cmd,
+            (
+                "# note: disaggregated KV transfer / connector flags are not emitted; "
+                "configure for your deployment's KV connector"
+            ),
         ]
     else:
         commands = [decode_cmd]
@@ -234,7 +248,7 @@ def point_launch_args(
         "--max-num-seqs" in decode_args or "--max-num-seqs" in prefill_args
     ) and hbm_reserve_gb == 0.0:
         commands.append(
-            "# Note: --max-num-seqs is an upper bound on what fits when "
+            "# note: --max-num-seqs is an upper bound on what fits when "
             "--hbm-reserve-gb is 0"
         )
 

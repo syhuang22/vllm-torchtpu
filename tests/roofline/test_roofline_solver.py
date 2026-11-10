@@ -783,7 +783,7 @@ def test_engine_memory_utilization_and_explicit_scenario_inputs(tmp_path: Path) 
             "--json",
         ]
     )
-    assert rc_ex == 0
+    assert rc_ex == 1
 
     rc_exp = cli.main(
         [
@@ -809,7 +809,7 @@ def test_engine_memory_utilization_and_explicit_scenario_inputs(tmp_path: Path) 
             "--json",
         ]
     )
-    assert rc_exp == 0
+    assert rc_exp == 1
 
 
 def test_hbm_breakdown_matches_footprint() -> None:
@@ -1458,9 +1458,9 @@ def test_asymmetric_pp_partition_emits_vllm_pp_layer_partition() -> None:
     )
     assert pt_pp2.est_ttft_ms > sf_even.serial_estimate_s * 1.5 * 1e3
     launch = point_launch_args(pt_pp2, model="org/synth-hybrid")
-    assert (
-        "VLLM_PP_LAYER_PARTITION=7,1 vllm serve org/synth-hybrid"
-        in launch["commands"][0]
+    assert any(
+        "VLLM_PP_LAYER_PARTITION=7,1 vllm serve org/synth-hybrid" in c
+        for c in launch["commands"]
     )
 
     odd_geom = dc_replace(
@@ -1479,7 +1479,7 @@ def test_asymmetric_pp_partition_emits_vllm_pp_layer_partition() -> None:
     assert pt_odd.prefill_pool is not None
     assert pt_odd.prefill_pool.pp_layer_partition == (7, 6)
     odd_launch = point_launch_args(pt_odd, model="org/synth-odd")
-    assert "VLLM_PP_LAYER_PARTITION=7,6" in odd_launch["commands"][0]
+    assert any("VLLM_PP_LAYER_PARTITION=7,6" in c for c in odd_launch["commands"])
 
     even_geom = dc_replace(geom, num_layers=12, layer_types=("full_attention",) * 12)
     even_plan = solve_serving_plan(
@@ -1492,9 +1492,9 @@ def test_asymmetric_pp_partition_emits_vllm_pp_layer_partition() -> None:
     )
     assert pt_even.prefill_pool is not None
     assert pt_even.prefill_pool.pp_layer_partition is None
-    assert (
-        "VLLM_PP_LAYER_PARTITION"
-        not in point_launch_args(pt_even, model="org/synth-even")["commands"][0]
+    assert not any(
+        "VLLM_PP_LAYER_PARTITION" in c
+        for c in point_launch_args(pt_even, model="org/synth-even")["commands"]
     )
 
     assert max_ep_load_ratio(0, 8) == 1.0

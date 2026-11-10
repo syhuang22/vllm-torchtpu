@@ -241,9 +241,17 @@ def test_emit_launch_args_mixed_and_disagg() -> None:
         model="Qwen/Qwen3.5-397B-A17B-FP8",
     )
     assert "--prefill-context-parallel-size" in disagg_out["prefill_cli_args"]
-    assert len(disagg_out["commands"]) == _COMMANDS_COUNT_2
-    assert disagg_out["commands"][0].startswith("# prefill (1x 2x2x1): vllm serve")
-    assert disagg_out["commands"][1].startswith("# decode (2x 2x2x2): vllm serve")
+    assert any(c.startswith("# provision: prefill") for c in disagg_out["commands"])
+    assert any(c.startswith("# provision: decode") for c in disagg_out["commands"])
+    assert any(
+        c.startswith("vllm serve") and "--prefill-context-parallel-size" in c
+        for c in disagg_out["commands"]
+    )
+    assert any(
+        c.startswith("vllm serve") and "--decode-context-parallel-size" not in c
+        for c in disagg_out["commands"]
+    )
+    assert any(c.startswith("# note:") for c in disagg_out["commands"])
 
 
 def test_emit_launch_args_infeasible_plan_returns_empty_and_cli_nonzero(

@@ -19,7 +19,6 @@ import ast
 from pathlib import Path
 
 import pytest
-from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.roofline as rf
 from vllm_torchtpu.roofline import CHIPS, chips
@@ -54,8 +53,14 @@ QWEN35_CFG: dict[str, object] = {
 }
 
 
+def _get_pallas_tpu():
+    """Import and return jax.experimental.pallas.tpu or skip test."""
+    return pytest.importorskip("jax.experimental.pallas.tpu")
+
+
 def test_chip_table_matches_jax_tpu_info() -> None:
     """Verify CHIPS['tpu7x'] parameters exactly match JAX's TPU info table."""
+    pltpu = _get_pallas_tpu()
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     c = CHIPS["tpu7x"]
     assert c.hbm_bytes == info.hbm_capacity_bytes

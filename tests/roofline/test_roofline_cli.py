@@ -437,3 +437,46 @@ def test_every_cli_flag_has_help(
     )
     assert rc_alias == 0
     _ = capsys.readouterr()
+
+
+def test_solve_exits_nonzero_on_empty_frontier(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify solve exits non-zero on empty frontier and returns 2 on loader errors."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(QWEN35_CFG))
+
+    # Empty frontier (397B weights cannot fit on 1 TPU chip) exits 1
+    # with warnings on stderr.
+    rc_empty = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--max-chips",
+            "1",
+            "--example-scenario",
+            "chat-8k1k",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert rc_empty == 1
+    assert "WARNING:" in captured.err
+
+    # Invalid model path or name prints a single clean error line to stderr and exits 2.
+    rc_err = cli.main(
+        [
+            "solve",
+            "--config",
+            str(tmp_path / "nonexistent_dir" / "config.json"),
+            "--max-chips",
+            "1",
+            "--example-scenario",
+            "chat-8k1k",
+        ]
+    )
+    captured_err = capsys.readouterr()
+    assert rc_err == 2
+    err_lines = [line for line in captured_err.err.splitlines() if line.strip()]
+    assert len(err_lines) == 1
+    assert err_lines[0].startswith("error:")

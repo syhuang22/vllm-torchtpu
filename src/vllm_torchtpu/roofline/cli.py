@@ -390,6 +390,7 @@ def _add_scenario_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--max-chips",
+        "--num-chips",
         type=int,
         default=None,
         help=(
@@ -733,17 +734,21 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "One of --config, --model, or --from-serve-cmd with a model is required."
         )
-    cfg = load_hf_config(src)
-    q_sub = cfg.get("text_config")
-    has_qcfg = bool(
-        cfg.get("quantization_config")
-        or (type(q_sub) is dict and q_sub.get("quantization_config"))
-    )
-    if "quantization" in serve_parsed and not has_qcfg:
-        q_val = str(serve_parsed["quantization"]).lower()
-        if q_val and q_val != "none":
-            cfg = {**cfg, "quantization_config": {"quant_method": q_val}}
-    geom = from_hf_config(cfg)
+    try:
+        cfg = load_hf_config(src)
+        q_sub = cfg.get("text_config")
+        has_qcfg = bool(
+            cfg.get("quantization_config")
+            or (type(q_sub) is dict and q_sub.get("quantization_config"))
+        )
+        if "quantization" in serve_parsed and not has_qcfg:
+            q_val = str(serve_parsed["quantization"]).lower()
+            if q_val and q_val != "none":
+                cfg = {**cfg, "quantization_config": {"quant_method": q_val}}
+        geom = from_hf_config(cfg)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 2
     chip = CHIPS[args.chip]
 
     if args.cmd in ("solve", "emit", "ceiling"):
@@ -1033,16 +1038,31 @@ def main(argv: list[str] | None = None) -> int:
             )
             write_html(payload_html, args.html)
 
+        warnings_to_emit = list(splan.warnings)
+        if not splan.frontier and not warnings_to_emit:
+            warnings_to_emit.append(
+                "No feasible layout met memory and latency constraints."
+            )
+        for w in warnings_to_emit:
+            sys.stderr.write(f"WARNING: {w}\n")
+
+        if not splan.frontier:
+            if args.json:
+                payload = build_solve_payload(
+                    splan, chip=chip, dtypes=dt_auto, model=src
+                )
+                sys.stdout.write(json.dumps(payload) + "\n")
+            return 1
+
         if args.json:
             payload = build_solve_payload(splan, chip=chip, dtypes=dt_auto, model=src)
             sys.stdout.write(json.dumps(payload) + "\n")
             return 0
-        for w in splan.warnings:
-            sys.stdout.write(f"WARNING: {w}\n")
+
         sys.stdout.write(
             f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pools':<24}  "
-            f"{'est_int_tok_s':>13}  {'tok_tput_chip':>13}  {'est_ttft_ms':>11}  "
-            f"{'est_tpot_ms':>11}\n"
+            f"{'est_int_tok_s':>13}  {'tok_tput_chip':>13}  {'bound_tpot_ms':>13}  "
+            f"{'est_ttft_ms':>11}  {'est_tpot_ms':>11}\n"
         )
         for pt in splan.frontier:
             if pt.prefill_pool is not None:
@@ -1056,8 +1076,13 @@ def main(argv: list[str] | None = None) -> int:
                 f"{pt.mode:<7}  {pt.concurrency:>5}  {pt.total_chips:>5}  "
                 f"{pools:<24}  {pt.est_interactivity_tok_s:>13.2f}  "
                 f"{pt.token_throughput_per_chip:>13.1f}  "
+                f"{pt.bound_tpot_ms:>13.2f}  "
                 f"{pt.est_ttft_ms:>11.1f}  {pt.est_tpot_ms:>11.2f}\n"
             )
+        sys.stdout.write(
+            "# Note: bound_* columns are hard physical lower bounds; "
+            "est_* columns are model estimates.\n"
+        )
         return 0
 
     if args.ici_bw_gbps is not None:

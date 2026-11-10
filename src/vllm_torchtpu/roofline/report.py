@@ -572,7 +572,7 @@ def _render_table_rows(top_k: list[dict[str, Any]]) -> str:
     """Format top candidate layout options into HTML table rows."""
     if not top_k:
         return (
-            '<tr><td colspan="12" style="text-align:center;">'
+            '<tr><td colspan="13" style="text-align:center;">'
             "No feasible layouts found</td></tr>"
         )
     rows: list[str] = []
@@ -586,6 +586,7 @@ def _render_table_rows(top_k: list[dict[str, Any]]) -> str:
         chips_val = pt.get("total_chips", 0)
         int_val = f"{pt.get('est_interactivity_tok_s', 0.0):.1f}"
         tput_val = f"{pt.get('token_throughput_per_chip', 0.0):.1f}"
+        bound_tpot_val = f"{pt.get('bound_tpot_ms', 0.0):.2f}"
         ttft_val = f"{pt.get('est_ttft_ms', 0.0):.1f}"
         tpot_val = f"{pt.get('est_tpot_ms', 0.0):.2f}"
         cap_raw = pt.get("kv_cache_capacity_tokens")
@@ -616,6 +617,7 @@ def _render_table_rows(top_k: list[dict[str, Any]]) -> str:
             f"<td><code>{_escape(p_str)}</code></td>"
             f"<td>{int_val}</td>"
             f"<td>{tput_val}</td>"
+            f"<td>{bound_tpot_val}</td>"
             f"<td>{ttft_val}</td>"
             f"<td>{tpot_val}</td>"
             f"<td>{_escape(cap_str)} / {eff_hit:.2f}</td>"
@@ -875,6 +877,12 @@ def render_html(payload: dict[str, Any]) -> str:
         "  </section>",
         '  <section id="frontier-chart" class="card">',
         "    <h2>Pareto Frontier (Interactivity vs. Throughput)</h2>",
+        (
+            '    <p class="section-note" '
+            'style="color:var(--text-muted);font-size:13px;margin-top:4px;">'
+            "Throughput and interactivity are model estimates (<code>est_*</code>); "
+            "latency bounds (<code>bound_*</code>) are hard physical lower limits.</p>"
+        ),
         f'    <div class="chart-container">{frontier_svg}</div>',
         "  </section>",
         '  <section id="limits-chart" class="card">',
@@ -896,10 +904,11 @@ def render_html(payload: dict[str, Any]) -> str:
         "          <th>Conc</th>",
         "          <th>Chips</th>",
         "          <th>Pools</th>",
-        "          <th>Int (tok/s)</th>",
+        "          <th>Int (tok/s) [est]</th>",
         "          <th>Tput (tok/s/chip)</th>",
-        "          <th>TTFT (ms)</th>",
-        "          <th>TPOT (ms)</th>",
+        "          <th>TPOT Bound (ms) [bound]</th>",
+        "          <th>TTFT (ms) [est]</th>",
+        "          <th>TPOT (ms) [est]</th>",
         "          <th>KV Cap / Hit</th>",
         "          <th>Launch Command</th>",
         "        </tr>",
@@ -908,6 +917,14 @@ def render_html(payload: dict[str, Any]) -> str:
         f"        {top_table_body}",
         "      </tbody>",
         "    </table>",
+        (
+            '    <p class="section-note" '
+            'style="color:var(--text-muted);font-size:13px;margin-top:8px;">'
+            "Note: Columns marked <code>[bound]</code> (such as "
+            "<code>bound_tpot_ms</code>) are hard physical lower bounds; "
+            "columns marked <code>[est]</code> (such as <code>est_ttft_ms</code> "
+            "and <code>est_tpot_ms</code>) are model estimates.</p>"
+        ),
         "  </section>",
         *_render_assumptions_card(payload),
         "  <footer>",

@@ -2601,7 +2601,9 @@ def solve_serving_plan(
 
     slo_candidates = [p for p in candidates if p.slo_met]
     pool_for_frontier = slo_candidates if slo_candidates else candidates
-    if candidates and not slo_candidates and not warnings:
+    if not candidates and not warnings:
+        warnings.append("No feasible layout met memory and latency constraints.")
+    elif candidates and not slo_candidates and not warnings:
         warnings.append("SLO_UNMET: no feasible topology met both TTFT and TPOT bounds")
 
     frontier = _pareto_filter(pool_for_frontier)
@@ -3844,7 +3846,7 @@ def sweep_prefix_hit_crossovers(
     *,
     hit_rates: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 0.9, 0.95),
 ) -> tuple[tuple[float, float] | None, float | None]:
-    """Sweep candidate HBM-fit pools across prefix hit rates in under 50 ms."""
+    """Sweep candidate HBM-fit pools across prefix hit rates."""
     if plan.recommended is None:
         return (None, None)
     raw_cands = (
