@@ -28,6 +28,14 @@ skip on v6e skip there. A new TPU step's label starts with
 key with `${TPU_KEY_PREFIX:-}`, or the second generation's upload is rejected
 for a duplicate key.
 
+Both generations' sharded steps report to the same Test Engine suite, `tpu-ci`,
+and bktec splits a step's files across its shards by each file's recorded
+duration. The same file runs at a different speed on each generation, so the
+tests plugin's `location-prefix` is the generation's name: bktec plans and
+uploads under `v6e/tests/...` or `v7x/tests/...` and runs the unprefixed paths,
+which keeps each generation's durations apart. A new generation gets its own
+prefix from `TPU_GENERATION`, with no change to the suite.
+
 The `integration` lane, `pipeline_integration.yml`, goes up the same way, once
 per generation in `TPU_GENERATION_FILES`, with the same names and soft-fail
 on v6e: its eight-core steps take a v6e 2x4 slice where v7x's take a 2x2x1.
