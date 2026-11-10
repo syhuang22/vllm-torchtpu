@@ -28,10 +28,8 @@ from typing import TYPE_CHECKING, Final, cast
 import numpy as np
 import torch
 
-from vllm_torchtpu.layers.adapter.sample.request_slot_table import (
-    broadcast_amax_scatter,
-    scatter_slot_rows,
-)
+from vllm_torchtpu.layers.adapter.sample.request_slot_table import scatter_slot_rows
+from vllm_torchtpu.layers.adapter.sample.scatter_ops import broadcast_amax_scatter
 
 if TYPE_CHECKING:
     from vllm.config.reasoning import ReasoningConfig

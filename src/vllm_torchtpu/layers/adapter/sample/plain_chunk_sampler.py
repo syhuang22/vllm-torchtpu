@@ -13,8 +13,9 @@
 # limitations under the License.
 """Shared plain-chunk logits-masking and sampling pipeline.
 
-Consolidates raw-logprob capture, grammar / ``min_tokens`` / future
-``LogitsProcessor`` masking, ``thinking_token_budget`` forcing, and greedy /
+Consolidates grammar masking, post-grammar ``raw_logprobs`` capture, stateful
+and stateless ``PlainChunkProcessor`` hooks (``min_tokens``,
+``thinking_token_budget``, and future ``LogitsProcessor``s), and greedy /
 stochastic sampling for both plain decode steps and draft-less chunks inside
 speculative steps.
 """
@@ -23,14 +24,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
-from typing import TYPE_CHECKING, Protocol
+from dataclasses import dataclass
+from typing import Protocol
 
 import torch
-
-if TYPE_CHECKING:
-    from vllm_torchtpu.layers.adapter.sample.thinking_budget_tracker import (
-        ThinkingBudgetStepState,
-    )
 
 type LogitsProcessorFn = Callable[[torch.Tensor], torch.Tensor]
 type SamplingParamsBuilderFn = Callable[
@@ -52,10 +49,35 @@ class SampleFromLogitsFn(Protocol):
     ) -> torch.Tensor: ...
 
 
+class PlainChunkProcessor(Protocol):
+    """Per-chunk pre-sample mask and post-sample state update hook."""
+
+    def mask_logits(self, logits: torch.Tensor) -> torch.Tensor: ...
+
+    def on_sampled(self, selected_token_ids: torch.Tensor) -> None: ...
+
+    def override_top_tokens(self, selected_token_ids: torch.Tensor) -> torch.Tensor: ...
+
+
+@dataclass(frozen=True)
+class StatelessPlainChunkProcessor:
+    """Adapter wrapping a stateless ``logits -> logits`` mask function."""
+
+    mask_fn: LogitsProcessorFn
+
+    def mask_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        return self.mask_fn(logits)
+
+    def on_sampled(self, selected_token_ids: torch.Tensor) -> None:
+        return None
+
+    def override_top_tokens(self, selected_token_ids: torch.Tensor) -> torch.Tensor:
+        return selected_token_ids
+
+
 def sample_plain_chunk(
     logits: torch.Tensor,
     *,
-    batch_req_ids: Sequence[str | None],
     cur_start_idx: int,
     cur_end_idx: int,
     top_tokens: bool,
@@ -68,47 +90,30 @@ def sample_plain_chunk(
     topk_candidates: int = 0,
     apply_topk_topp: bool = True,
     grammar_mask_fn: LogitsProcessorFn | None = None,
-    logits_processors: Sequence[LogitsProcessorFn] = (),
-    tb_step: ThinkingBudgetStepState | None = None,
+    processors: Sequence[PlainChunkProcessor] = (),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Mask and sample a non-verify chunk ``[cur_start_idx, cur_end_idx)``.
 
-    Returns ``(selected_token_ids, logprob_logits)``, preserving the unmasked
-    ``logprob_logits`` tensor for ``gather_logprobs`` (matching upstream vLLM's
-    default ``raw_logprobs`` behavior).
+    Returns ``(selected_token_ids, logprob_logits)``. Matching upstream vLLM
+    (``apply_grammar_bitmask`` in-place followed by ``Sampler.raw_logprobs``
+    before ``logits_processors``), ``logprob_logits`` is captured immediately
+    after ``grammar_mask_fn`` and before ``processors`` run.
     """
-    logprob_logits = logits
     if grammar_mask_fn is not None:
         logits = grammar_mask_fn(logits)
-    if not top_tokens:
-        for proc in logits_processors:
-            logits = proc(logits)
+    # Upstream vLLM applies grammar bitmasks in-place before Sampler computes
+    # raw_logprobs, and runs logits processors (min_tokens, thinking_budget,
+    # penalties) afterward.
+    logprob_logits = logits
 
     with sample_stage:
         if top_tokens:
             selected = logits
-            if tb_step is not None:
-                selected = tb_step.override_and_advance_plain(
-                    logits.device,
-                    batch_req_ids,
-                    cur_start_idx,
-                    cur_end_idx,
-                    selected,
-                )
+            for proc in processors:
+                selected = proc.override_top_tokens(selected)
         else:
-            tb_slots = (
-                tb_step.chunk_slot_ids(
-                    logits.device,
-                    batch_req_ids,
-                    cur_start_idx,
-                    cur_end_idx,
-                )
-                if tb_step is not None
-                else None
-            )
-            if tb_slots is not None:
-                assert tb_step is not None
-                logits = tb_step.mask_plain_logits(logits, tb_slots)
+            for proc in processors:
+                logits = proc.mask_logits(logits)
             if all_greedy:
                 assert greedy_sample_fn is not None
                 selected = greedy_sample_fn(logits)
@@ -125,40 +130,16 @@ def sample_plain_chunk(
                     dtype=torch.float32,
                     generator=sampling_generator,
                 )
-                selected = sample_from_logits_func_call(
-                    sample_from_logits_fn,
+                selected = sample_from_logits_fn(
                     logits,
                     temperatures_tpu,
                     u,
                     top_k_tpu,
                     top_p_tpu,
+                    all_greedy=False,
                     topk_candidates=topk_candidates,
                     apply_topk_topp=apply_topk_topp,
                 )
-            if tb_slots is not None:
-                assert tb_step is not None
-                tb_step.advance_plain(tb_slots, selected)
+            for proc in processors:
+                proc.on_sampled(selected)
     return selected, logprob_logits
-
-
-def sample_from_logits_func_call(
-    sample_from_logits_fn: SampleFromLogitsFn,
-    logits: torch.Tensor,
-    temperatures_tpu: torch.Tensor,
-    u: torch.Tensor,
-    top_k_tpu: torch.Tensor,
-    top_p_tpu: torch.Tensor,
-    *,
-    topk_candidates: int,
-    apply_topk_topp: bool,
-) -> torch.Tensor:
-    return sample_from_logits_fn(
-        logits,
-        temperatures_tpu,
-        u,
-        top_k_tpu,
-        top_p_tpu,
-        all_greedy=False,
-        topk_candidates=topk_candidates,
-        apply_topk_topp=apply_topk_topp,
-    )

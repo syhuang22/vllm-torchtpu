@@ -405,16 +405,8 @@ class ThinkingBudgetStepState:
         self.commit()
 
     def override_and_advance_plain(
-        self,
-        device: torch.device,
-        batch_req_ids: Sequence[str | None],
-        start_idx: int,
-        end_idx: int,
-        selected_token_ids: torch.Tensor,
+        self, slot_ids: torch.Tensor, selected_token_ids: torch.Tensor
     ) -> torch.Tensor:
-        slot_ids = self.chunk_slot_ids(device, batch_req_ids, start_idx, end_idx)
-        if slot_ids is None:
-            return selected_token_ids
         out, self.state_table = tb_kernels.override_and_advance_plain(
             self.state_table,
             slot_ids,
@@ -423,6 +415,18 @@ class ThinkingBudgetStepState:
         )
         self.commit()
         return out
+
+    def plain_chunk(
+        self,
+        device: torch.device,
+        batch_req_ids: Sequence[str | None],
+        start_idx: int,
+        end_idx: int,
+    ) -> ThinkingBudgetPlainChunk | None:
+        slot_ids = self.chunk_slot_ids(device, batch_req_ids, start_idx, end_idx)
+        if slot_ids is None:
+            return None
+        return ThinkingBudgetPlainChunk(self, slot_ids)
 
     def spec_chunk(
         self,
@@ -435,6 +439,23 @@ class ThinkingBudgetStepState:
         if slot_ids is None:
             return None
         return ThinkingBudgetSpecChunk(self, slot_ids)
+
+
+@dataclass(frozen=True)
+class ThinkingBudgetPlainChunk:
+    """``PlainChunkProcessor`` handle for one non-verify batch chunk."""
+
+    step: ThinkingBudgetStepState
+    slot_ids: torch.Tensor
+
+    def mask_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        return self.step.mask_plain_logits(logits, self.slot_ids)
+
+    def on_sampled(self, selected_token_ids: torch.Tensor) -> None:
+        self.step.advance_plain(self.slot_ids, selected_token_ids)
+
+    def override_top_tokens(self, selected_token_ids: torch.Tensor) -> torch.Tensor:
+        return self.step.override_and_advance_plain(self.slot_ids, selected_token_ids)
 
 
 @dataclass(frozen=True)

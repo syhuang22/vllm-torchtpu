@@ -548,80 +548,6 @@ MIN_NUM_SEQS = 8
 SAMPLING_EPS = 1e-5
 
 
-def _sample_runner_plain_chunk(
-    runner: Any,
-    logits: torch.Tensor,
-    *,
-    cur_start_idx: int,
-    cur_end_idx: int,
-    top_tokens: bool,
-    all_greedy: bool,
-    sampling_generator: torch.Generator | None,
-    grammar_output: "GrammarOutput | None",
-    scheduled_spec_decode_tokens: Mapping[str, Sequence[int]] | None,
-    min_toks: min_tokens_mask.MinTokensState,
-    tb_step: thinking_budget_tracker.ThinkingBudgetStepState | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    grammar_mask_fn: plain_chunk_sampler.LogitsProcessorFn | None = None
-    if grammar_output is not None:
-        if scheduled_spec_decode_tokens is not None:
-
-            def _mask_spec_grammar(lg: torch.Tensor) -> torch.Tensor:
-                _, masked = runner.structured_decoding_manager.mask_spec_logits(
-                    None,
-                    lg,
-                    grammar_output,
-                    scheduled_spec_decode_tokens,
-                    None,
-                    cur_start_idx,
-                    cur_end_idx,
-                )
-                return masked
-
-            grammar_mask_fn = _mask_spec_grammar
-        else:
-
-            def _mask_plain_grammar(lg: torch.Tensor) -> torch.Tensor:
-                return runner.structured_decoding_manager.mask_logits(
-                    lg, grammar_output, cur_start_idx, cur_end_idx
-                )
-
-            grammar_mask_fn = _mask_plain_grammar
-
-    processors: tuple[plain_chunk_sampler.LogitsProcessorFn, ...] = ()
-    if min_toks and not top_tokens:
-        rows = min_tokens_mask.plain_rows(min_toks, cur_start_idx, cur_end_idx)
-        processors = (lambda lg: runner._mask_min_tokens(lg, rows, min_toks),)
-
-    use_random = not top_tokens and not all_greedy
-    return plain_chunk_sampler.sample_plain_chunk(
-        logits,
-        batch_req_ids=runner.input_batch.req_ids,
-        cur_start_idx=cur_start_idx,
-        cur_end_idx=cur_end_idx,
-        top_tokens=top_tokens,
-        all_greedy=all_greedy,
-        sampling_generator=sampling_generator,
-        sample_stage=runner._stage_timing.stage("sample"),
-        greedy_sample_fn=(
-            runner._greedy_sample if not top_tokens and all_greedy else None
-        ),
-        sample_from_logits_fn=(runner.sample_from_logits_func if use_random else None),
-        build_sampling_params_fn=(
-            runner._build_padded_sampling_params if use_random else None
-        ),
-        topk_candidates=(
-            runner._sampler_topk_candidates(cur_start_idx, cur_end_idx, grammar_output)
-            if use_random
-            else 0
-        ),
-        apply_topk_topp=(runner._sampler_applies_topk_topp() if use_random else True),
-        grammar_mask_fn=grammar_mask_fn,
-        logits_processors=processors,
-        tb_step=tb_step,
-    )
-
-
 def _get_sequence_layout_planner_for_runner(runner: Any):
     return runner.sequence_layout_planner
 
@@ -5083,6 +5009,95 @@ class TPUModelRunner(GPUModelRunner):
             return logits
         return min_tokens_mask.apply_stop_table(logits, *table)
 
+    def _sample_plain_chunk(
+        self,
+        logits: torch.Tensor,
+        *,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        top_tokens: bool,
+        all_greedy: bool,
+        sampling_generator: torch.Generator | None,
+        grammar_output: "GrammarOutput | None",
+        scheduled_spec_decode_tokens: Mapping[str, Sequence[int]] | None,
+        min_toks: min_tokens_mask.MinTokensState,
+        tb_step: thinking_budget_tracker.ThinkingBudgetStepState | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Mask and sample a plain chunk ``[cur_start_idx, cur_end_idx)``."""
+        grammar_mask_fn: plain_chunk_sampler.LogitsProcessorFn | None = None
+        if grammar_output is not None:
+            if scheduled_spec_decode_tokens is not None:
+
+                def _mask_spec_grammar(lg: torch.Tensor) -> torch.Tensor:
+                    _, masked = self.structured_decoding_manager.mask_spec_logits(
+                        None,
+                        lg,
+                        grammar_output,
+                        scheduled_spec_decode_tokens,
+                        None,
+                        cur_start_idx,
+                        cur_end_idx,
+                    )
+                    return masked
+
+                grammar_mask_fn = _mask_spec_grammar
+            else:
+
+                def _mask_plain_grammar(lg: torch.Tensor) -> torch.Tensor:
+                    return self.structured_decoding_manager.mask_logits(
+                        lg, grammar_output, cur_start_idx, cur_end_idx
+                    )
+
+                grammar_mask_fn = _mask_plain_grammar
+
+        processors: list[plain_chunk_sampler.PlainChunkProcessor] = []
+        if min_toks and not top_tokens:
+            rows = min_tokens_mask.plain_rows(min_toks, cur_start_idx, cur_end_idx)
+            processors.append(
+                plain_chunk_sampler.StatelessPlainChunkProcessor(
+                    lambda lg: self._mask_min_tokens(lg, rows, min_toks)
+                )
+            )
+        if tb_step is not None:
+            tb_proc = tb_step.plain_chunk(
+                logits.device,
+                self.input_batch.req_ids,
+                cur_start_idx,
+                cur_end_idx,
+            )
+            if tb_proc is not None:
+                processors.append(tb_proc)
+
+        use_random = not top_tokens and not all_greedy
+        return plain_chunk_sampler.sample_plain_chunk(
+            logits,
+            cur_start_idx=cur_start_idx,
+            cur_end_idx=cur_end_idx,
+            top_tokens=top_tokens,
+            all_greedy=all_greedy,
+            sampling_generator=sampling_generator,
+            sample_stage=self._stage_timing.stage("sample"),
+            greedy_sample_fn=(
+                self._greedy_sample if not top_tokens and all_greedy else None
+            ),
+            sample_from_logits_fn=(
+                self.sample_from_logits_func if use_random else None
+            ),
+            build_sampling_params_fn=(
+                self._build_padded_sampling_params if use_random else None
+            ),
+            topk_candidates=(
+                self._sampler_topk_candidates(
+                    cur_start_idx, cur_end_idx, grammar_output
+                )
+                if use_random
+                else 0
+            ),
+            apply_topk_topp=(self._sampler_applies_topk_topp() if use_random else True),
+            grammar_mask_fn=grammar_mask_fn,
+            processors=processors,
+        )
+
     def _sample_spec_verify_chunk(
         self,
         logits: torch.Tensor,
@@ -5380,12 +5395,13 @@ class TPUModelRunner(GPUModelRunner):
         tb_step = None
         if not self.is_pooling_model and state.logits_list and self._thinking_budget:
             tb_device = state.logits_list[0].device
-            if (
-                self._pre_async_results is not None
-                and self._thinking_budget.needs_output_reseed(req_ids, tb_device)
-            ):
-                self._modify_prev_results()
-                self._pre_async_results = None
+            if self._pre_async_results is not None:
+                in_flight = set(self._pre_async_results.req_ids)
+                if self._thinking_budget.needs_output_reseed(
+                    (r for r in req_ids if r in in_flight), tb_device
+                ):
+                    self._modify_prev_results()
+                    self._pre_async_results = None
             tb_step = self._thinking_budget.step_state(
                 tb_device,
                 req_ids,
@@ -5455,7 +5471,7 @@ class TPUModelRunner(GPUModelRunner):
                             )
                         )
                 else:
-                    selected, logprob_logits = _sample_runner_plain_chunk(
+                    selected, logprob_logits = TPUModelRunner._sample_plain_chunk(
                         self,
                         logits,
                         cur_start_idx=cur_start_idx,
@@ -5508,7 +5524,7 @@ class TPUModelRunner(GPUModelRunner):
                 # Non-spec step (prefill / plain decode): reset the mamba
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
-                selected_token_ids, logprob_logits = _sample_runner_plain_chunk(
+                selected_token_ids, logprob_logits = TPUModelRunner._sample_plain_chunk(
                     self,
                     logits,
                     cur_start_idx=cur_start_idx,

@@ -25,12 +25,11 @@ uploads across steady-state decode steps.
 
 from collections.abc import Callable, Container, Iterable, Sequence
 from collections.abc import Set as AbstractSet
-from typing import Final
 
 import numpy as np
 import torch
 
-_AMAX_SENTINEL: Final[int] = torch.iinfo(torch.int32).min
+from vllm_torchtpu.layers.adapter.sample.scatter_ops import broadcast_amax_scatter
 
 
 def same_target_device(actual: torch.device, requested: torch.device) -> bool:
@@ -49,41 +48,6 @@ def same_target_device(actual: torch.device, requested: torch.device) -> bool:
         else 0
     )
     return actual.index == default_idx
-
-
-def broadcast_amax_scatter(
-    base: torch.Tensor,
-    indices: torch.Tensor,
-    values: torch.Tensor,
-    valid_mask: torch.Tensor,
-) -> torch.Tensor:
-    """Scatter ``values`` into ``base`` at unique valid ``indices`` via ``amax``.
-
-    Uses a masked broadcast + ``amax`` reduction rather than
-    ``Tensor.scatter(0, ...)``, whose XLA lowering for dynamic colliding
-    indices adds ~7 ms/step on TPU v7x. Active ``indices[valid_mask]`` must be
-    pairwise distinct and within ``[0, base.shape[0])``.
-    """
-    if indices.shape[0] == 0:
-        return base
-    if base.device.type == "cpu" and not torch.compiler.is_compiling():
-        active_idx = indices[valid_mask]
-        assert active_idx.numel() == torch.unique(active_idx).numel(), (
-            "Duplicate active indices passed to broadcast_amax_scatter"
-        )
-    target_idx = torch.arange(
-        base.shape[0], dtype=indices.dtype, device=base.device
-    ).unsqueeze(1)
-    match = valid_mask.unsqueeze(0) & (target_idx == indices.unsqueeze(0))
-    trailing_ones = (1,) * (base.ndim - 1)
-    match_view = match.reshape(*match.shape, *trailing_ones)
-    cand = torch.where(
-        match_view,
-        values.to(base.dtype).unsqueeze(0),
-        _AMAX_SENTINEL,
-    ).amax(dim=1)
-    any_match = match.any(dim=1).reshape(base.shape[0], *trailing_ones)
-    return torch.where(any_match, cand, base)
 
 
 def scatter_slot_rows(

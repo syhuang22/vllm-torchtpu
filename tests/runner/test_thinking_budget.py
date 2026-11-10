@@ -14,6 +14,7 @@
 """Tests for per-request ``thinking_token_budget`` on ``TPUModelRunner``."""
 
 import inspect
+import math
 from collections.abc import Iterable
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -48,9 +49,9 @@ from vllm_torchtpu.layers.adapter.sample import (
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.request_slot_table import (
     RequestSlotTable,
-    broadcast_amax_scatter,
     seed_slot_rows,
 )
+from vllm_torchtpu.layers.adapter.sample.scatter_ops import broadcast_amax_scatter
 from vllm_torchtpu.layers.adapter.sample.thinking_budget import (
     COL_IN_THINK,
     COL_THINK_COUNT,
@@ -262,6 +263,7 @@ def _make_sample_runner(
         TPUModelRunner._scheduled_draft_counts,
         TPUModelRunner._assemble_async_spec_substitution,
         TPUModelRunner._assemble_async_prefill_bootstrap,
+        TPUModelRunner._sample_plain_chunk,
         TPUModelRunner._sample_spec_verify_chunk,
         TPUModelRunner.spec_bonus_and_target_logits,
         TPUModelRunner.spec_bonus_and_target_tokens,
@@ -1175,7 +1177,8 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         assert dict(tracker.requests) == {"p": 5}
 
     def test_async_cold_reseed_and_chunked_prefill_discard(self) -> None:
-        # 1. Cold reseed in sample_tokens settles in-flight [0] placeholder first.
+        # 1a. Cold reseed in sample_tokens settles in-flight [0] placeholder first
+        # when the cold request itself is in _pre_async_results.req_ids.
         p0 = SamplingParams(temperature=0.0, thinking_token_budget=0)
         req0 = _request_state("r0", [5, 6], p0, output_token_ids=[0])
         runner0 = _make_sample_runner(
@@ -1185,6 +1188,10 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             vocab_size=128,
             async_scheduling=True,
         )
+        events0: list[str] = []
+        runner0._greedy_sample = lambda x: (
+            events0.append("sample") or torch.argmax(x, dim=-1, keepdim=True)
+        )
         runner0._thinking_budget.slots.release(["r0"])
         runner0.input_batch.num_tokens_no_spec[0] = 3
         runner0._pre_async_results = SimpleNamespace(
@@ -1192,14 +1199,54 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             request_seq_lens=[(0, req0, 2, "r0")],
             discard_sampled_tokens_req_indices=[],
             num_draft_per_req={},
-            wait_for_copy=lambda: torch.tensor([[42]], dtype=torch.int64),
+            wait_for_copy=lambda: (
+                events0.append("copy") or torch.tensor([[42]], dtype=torch.int64)
+            ),
         )
         logits0 = torch.zeros((4, 128))
         logits0[0, 55] = 8.0
         _set_exec_state(runner0, [logits0], {"r0": 1})
         assert _run_sample_tokens(runner0).get_output().sampled_token_ids == [[55]]
+        assert events0 == ["copy", "sample"]
         runner0._modify_prev_results()
         assert req0.output_token_ids == [42, 55]
+
+        # 1b. Cold re-entry of r0 when _pre_async_results only holds warm "other"
+        # keeps async overlap (sample dispatches before wait_for_copy).
+        req_other = _request_state("other", [1, 2], p0, output_token_ids=[0])
+        req_cold = _request_state("r0", [0], p0, output_token_ids=[7])
+        runner1 = _make_sample_runner(
+            _reasoning_config([0], [99]),
+            ["other", "r0"],
+            {"other": req_other, "r0": req_cold},
+            vocab_size=128,
+            async_scheduling=True,
+        )
+        runner1._thinking_budget.prepare_step(
+            torch.device("cpu"), ["other"], {"other": req_other}
+        )
+        runner1._thinking_budget.slots.release(["r0"])
+        events1: list[str] = []
+        runner1._greedy_sample = lambda x: (
+            events1.append("sample") or torch.argmax(x, dim=-1, keepdim=True)
+        )
+        runner1._pre_async_results = SimpleNamespace(
+            req_ids=["other"],
+            request_seq_lens=[(0, req_other, 2, "other")],
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req={},
+            wait_for_copy=lambda: (
+                events1.append("copy") or torch.tensor([[11]], dtype=torch.int64)
+            ),
+        )
+        logits1 = torch.zeros((4, 128))
+        logits1[:, 55] = 8.0
+        _set_exec_state(runner1, [logits1], {"other": 1, "r0": 1})
+        assert _run_sample_tokens(runner1).get_output().sampled_token_ids == [
+            [55],
+            [99],
+        ]
+        assert events1 == ["sample", "copy"]
 
         # 2. Chunked prefill (4/8 then 4/8 tokens) suppresses forcing & rewinds rng.
         prompt = [1, 2, 3, 4, 5, *GEMMA4_START]
@@ -1381,11 +1428,22 @@ class TestSampleTokens:
             req.num_computed_tokens += 1
             lp = res.logprobs
             assert lp is not None
-            assert np.isfinite(lp.logprobs[0]).all()
+            assert math.isfinite(float(lp.logprobs[0, 0]))
             assert int(lp.logprob_token_ids[0, 0]) == tok
-            # Pre-grammar raw logits keep token 99 (25.0) & 98 (18.0) as top-2!
-            assert lp.logprob_token_ids[0, 1:3].tolist() == [99, 98]
-            assert 1 <= int(lp.sampled_token_ranks[0]) <= 256
+            # Post-grammar, pre-processor raw_logprobs: grammar-disallowed 99 is
+            # masked out (-inf), while processors (min_tokens, thinking_budget)
+            # have not yet run on logprob_logits.
+            for j in (1, 2):
+                if math.isfinite(float(lp.logprobs[0, j])):
+                    assert int(lp.logprob_token_ids[0, j]) in allowed
+            if len(allowed) == 1:
+                assert lp.logprobs[0, 2] == float("-inf")
+            elif allowed == [50, 98]:
+                assert lp.logprob_token_ids[0, 1:3].tolist() == [98, 50]
+                assert np.isfinite(lp.logprobs[0, 1:3]).all()
+            else:
+                assert int(lp.logprob_token_ids[0, 1]) == 50
+            assert 1 <= int(lp.sampled_token_ranks[0]) <= len(allowed)
         assert emitted == [50, 50, GEMMA4_END[0], GEMMA4_END[1], 98]
 
         # Also verify unstructured min_tokens stop-masking when end_ids[0] is a stop:
@@ -1409,8 +1467,8 @@ class TestSampleTokens:
         assert emitted_s == [50, 50, GEMMA4_END[0], GEMMA4_END[1]]
 
     def test_sample_plain_chunk_custom_logits_processors(self) -> None:
-        """Verify ``sample_plain_chunk`` preserves raw logprob_logits and runs
-        ordered logits processors alongside ``ThinkingBudgetStepState``."""
+        """Verify ``sample_plain_chunk`` captures post-grammar ``logprob_logits``
+        and runs stateful ``PlainChunkProcessor`` hooks alongside thinking budget."""
         cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
         sp = SamplingParams(temperature=0.0, thinking_token_budget=0)
         req = _request_state("r0", [1, *GEMMA4_START], sp)
@@ -1420,20 +1478,40 @@ class TestSampleTokens:
             torch.device("cpu"), ["r0"], {"r0": req}, frozenset()
         )
         assert tb_step is not None
+        tb_proc = tb_step.plain_chunk(torch.device("cpu"), ["r0"], 0, 1)
+        assert tb_proc is not None
 
         raw = torch.zeros((4, 128), dtype=torch.float32)
+        raw[0, 99] = 20.0
         raw[0, 12] = 9.0
         raw[0, 13] = 5.0
 
-        def block_forced_and_12(lg: torch.Tensor) -> torch.Tensor:
+        def grammar_block_99(lg: torch.Tensor) -> torch.Tensor:
             out = lg.clone()
-            out[0, GEMMA4_END[0]] = float("-inf")
-            out[0, 12] = float("-inf")
+            out[0, 99] = float("-inf")
             return out
 
+        class _RecordingProcessor:
+            def __init__(self) -> None:
+                self.sampled: list[int] = []
+
+            def mask_logits(self, logits: torch.Tensor) -> torch.Tensor:
+                out = logits.clone()
+                out[0, GEMMA4_END[0]] = float("-inf")
+                out[0, 12] = float("-inf")
+                return out
+
+            def on_sampled(self, selected_token_ids: torch.Tensor) -> None:
+                self.sampled.append(int(selected_token_ids[0, 0].item()))
+
+            def override_top_tokens(
+                self, selected_token_ids: torch.Tensor
+            ) -> torch.Tensor:
+                return selected_token_ids
+
+        recorder = _RecordingProcessor()
         selected, logprob_logits = plain_chunk_sampler.sample_plain_chunk(
             raw,
-            batch_req_ids=["r0"],
             cur_start_idx=0,
             cur_end_idx=1,
             top_tokens=False,
@@ -1441,12 +1519,17 @@ class TestSampleTokens:
             sampling_generator=None,
             sample_stage=nullcontext(),
             greedy_sample_fn=lambda x: torch.argmax(x, dim=-1, keepdim=True),
-            logits_processors=(block_forced_and_12,),
-            tb_step=tb_step,
+            grammar_mask_fn=grammar_block_99,
+            processors=(recorder, tb_proc),
         )
-        assert logprob_logits is raw
-        assert torch.isfinite(logprob_logits).all()
+        assert logprob_logits[0, 99].item() == float("-inf")
+        assert logprob_logits[0, 12].item() == 9.0
+        assert logprob_logits[0, GEMMA4_END[0]].item() == 0.0
         assert int(selected[0, 0].item()) == 13
+        assert recorder.sampled == [13]
+        slot_r0 = tracker.slots.slot_for("r0")
+        assert slot_r0 == 1
+        assert int(tb_step.state_table[slot_r0, COL_THINK_COUNT].item()) == 1
 
     @pytest.mark.parametrize(
         "mode",
@@ -1614,8 +1697,9 @@ class TestSampleTokens:
             for idx, tok in enumerate((30, 31, 32)):
                 v_logits[idx, tok] = 6.0
             # On the draft-less chunk (r1), token 99 is disallowed by grammar (logit
-            # 15.0) while GEMMA4_END[0] is allowed: logprob_logits saved pre-grammar
-            # must report 99 as raw top-1 while sampling emits forced GEMMA4_END[0].
+            # 15.0) while 77 (6.0) and GEMMA4_END[0] (-20.0) are allowed: post-grammar
+            # logprob_logits excludes 99 and reports 77 as raw top-1 while sampling
+            # emits forced GEMMA4_END[0] with finite logprob.
             p_logits[0, 99] = 15.0
             p_logits[0, 77] = 6.0
             g_out = GrammarOutput(
@@ -1636,7 +1720,8 @@ class TestSampleTokens:
             res = _run_sample_tokens(runner, g_out)
             assert res.sampled_token_ids == [[30, GEMMA4_END[0]], [GEMMA4_END[0]]]
             assert res.logprobs is not None
-            assert int(res.logprobs.logprob_token_ids[2, 1]) == 99
+            assert math.isfinite(float(res.logprobs.logprobs[2, 0]))
+            assert int(res.logprobs.logprob_token_ids[2, 1]) == 77
 
 
 class TestPrecompileAndTPU:
@@ -1725,21 +1810,15 @@ class TestPrecompileAndTPU:
 
                 step = ThinkingBudgetStepState(tb, st_table, tb.markers, frozenset())
                 for num_reqs in runner.num_reqs_paddings:
-                    slots = step.chunk_slot_ids(torch.device("cpu"), ["r0"], 0, 1)
-                    assert slots is not None
-                    step.mask_plain_logits(
-                        torch.zeros((num_reqs, 128), dtype=torch.bfloat16), slots
+                    pchunk = step.plain_chunk(torch.device("cpu"), ["r0"], 0, 1)
+                    assert pchunk is not None
+                    pchunk.mask_logits(
+                        torch.zeros((num_reqs, 128), dtype=torch.bfloat16)
                     )
-                    step.advance_plain(
-                        slots, torch.zeros((num_reqs, 1), dtype=torch.int64)
-                    )
+                    pchunk.on_sampled(torch.zeros((num_reqs, 1), dtype=torch.int64))
                     if use_top_tokens:
-                        step.override_and_advance_plain(
-                            torch.device("cpu"),
-                            ["r0"],
-                            0,
-                            1,
-                            torch.zeros((num_reqs, 1), dtype=torch.int64),
+                        pchunk.override_top_tokens(
+                            torch.zeros((num_reqs, 1), dtype=torch.int64)
                         )
 
                 for num_tokens in runner._verify_logits_paddings():
