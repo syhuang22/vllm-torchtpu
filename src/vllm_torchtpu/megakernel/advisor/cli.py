@@ -28,7 +28,7 @@ from ..advisor.models import (
 )
 from ..core import errors
 from .calibrate import calibrate_trace
-from .chips import ChipSpec, resolve_chip_spec
+from .chips import ChipSpec, public_calibration_path, resolve_chip_spec
 from .regimes import (
     advise_regimes,
     recommend_parallelism,
@@ -409,6 +409,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     argv_list = list(sys.argv[1:] if argv is None else argv)
     if argv_list and argv_list[0] == "calibrate":
         return _run_calibrate_cli(argv_list[1:])
+    if argv_list and argv_list[0] == "estimate":
+        argv_list = argv_list[1:]
     parser = build_arg_parser()
     args = parser.parse_args(argv_list)
 
@@ -417,6 +419,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise errors.MegakernelConfigError(msg)
 
     profile, chip_spec = _resolve_cli_model_and_chip(args)
+
+    measurements_val = args.measurements
+    if measurements_val in ("bundled", "auto"):
+        bundled_path = public_calibration_path(chip_spec.name)
+        if bundled_path is None:
+            msg = (
+                "No bundled architectural priors available for chip "
+                f"'{chip_spec.name}'. Specify a custom path to --measurements."
+            )
+            raise errors.MegakernelConfigError(msg)
+        measurements_val = str(bundled_path)
 
     if args.regime_sweep or args.html:
         sweep = advise_regimes(
@@ -434,7 +447,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             vmem_budget_mib=args.vmem_budget_mib,
             dma_buffers=args.dma_buffers,
             deployment_preset=args.deployment_preset,
-            measurements=args.measurements,
+            measurements=measurements_val,
             objective=args.objective,
             dispatch_regime=args.dispatch_regime,
         )
@@ -471,7 +484,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile,
         workload,
         chip_spec,
-        measurements=args.measurements,
+        measurements=measurements_val,
     )
     exit_code = 2 if report.verdict.startswith("invalid_config(") else 0
     if args.json is not None:
