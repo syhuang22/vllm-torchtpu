@@ -33,6 +33,10 @@ if TYPE_CHECKING:
         resolve_chip_spec,
         verify_chip_spec_against_jax,
     )
+    from ..advisor.cli import (
+        build_arg_parser,
+        main,
+    )
     from ..advisor.models import (
         DEPLOYMENT_PRESET_SOURCES,
         DEPLOYMENT_PRESETS,
@@ -49,6 +53,20 @@ if TYPE_CHECKING:
         resolve_hf_snapshot_config,
         resolve_model_profile,
         supports_hf_config,
+    )
+    from ..advisor.regimes import (
+        advise_regimes,
+        compare_parallelism_candidates,
+        primary_step_mode,
+        recommend_parallelism,
+    )
+    from ..advisor.report import (
+        format_advisor_summary,
+        format_regime_table,
+        render_advisor_html,
+        render_regime_dot_plot_svg,
+        svg_text_width,
+        write_advisor_html,
     )
     from ..advisor.roofline import (
         validate_workload,
@@ -101,9 +119,13 @@ if TYPE_CHECKING:
 
 _SUBMODULES = frozenset(
     {
+        "assets",
         "chips",
+        "cli",
         "jax_bridge",
         "models",
+        "regimes",
+        "report",
         "roofline",
         "spec_bridge",
         "specs",
@@ -127,6 +149,9 @@ _LAZY = {
     "public_calibration_path": ".chips",
     "resolve_chip_spec": ".chips",
     "verify_chip_spec_against_jax": ".chips",
+    # cli
+    "build_arg_parser": ".cli",
+    "main": ".cli",
     # models
     "DEPLOYMENT_PRESETS": ".models",
     "DEPLOYMENT_PRESET_SOURCES": ".models",
@@ -143,6 +168,18 @@ _LAZY = {
     "resolve_hf_snapshot_config": ".models",
     "resolve_model_profile": ".models",
     "supports_hf_config": ".models",
+    # regimes
+    "advise_regimes": ".regimes",
+    "compare_parallelism_candidates": ".regimes",
+    "primary_step_mode": ".regimes",
+    "recommend_parallelism": ".regimes",
+    # report
+    "format_advisor_summary": ".report",
+    "format_regime_table": ".report",
+    "render_advisor_html": ".report",
+    "render_regime_dot_plot_svg": ".report",
+    "svg_text_width": ".report",
+    "write_advisor_html": ".report",
     # roofline
     "validate_workload": ".roofline",
     # spec_bridge
@@ -254,6 +291,9 @@ __all__ = [
     "WorkloadSpec",
     "advise",
     "advise_from_spec",
+    "advise_regimes",
+    "build_arg_parser",
+    "compare_parallelism_candidates",
     "compute_all_reduce_transfer_cost",
     "compute_per_token_vmem_bytes",
     "compute_scope_raw_step_us",
@@ -261,16 +301,25 @@ __all__ = [
     "detect_tpu_from_sysfs",
     "evaluate_support",
     "fit_vmem_budget_bytes",
+    "format_advisor_summary",
+    "format_regime_table",
     "load_chip_spec_file",
     "load_measurements",
     "load_public_calibration",
+    "main",
     "model_profile_from_hf_config",
+    "primary_step_mode",
     "public_calibration_path",
+    "recommend_parallelism",
+    "render_advisor_html",
+    "render_regime_dot_plot_svg",
     "resolve_chip_spec",
     "resolve_hf_snapshot_config",
     "resolve_model_profile",
     "supports_hf_config",
+    "svg_text_width",
     "validate_advise_inputs",
     "validate_workload",
     "verify_chip_spec_against_jax",
+    "write_advisor_html",
 ]
