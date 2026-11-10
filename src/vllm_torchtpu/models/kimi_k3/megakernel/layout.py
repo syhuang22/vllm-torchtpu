@@ -42,6 +42,8 @@ from .runtime_shim.layout import KVLayout, StateRegion
 
 TP_SIZE = 32
 TP_PEERS = TP_SIZE - 1
+DP2_GROUPS = 2
+HIDDEN_SIZE = 7168
 
 
 NUM_LAYERS = 93

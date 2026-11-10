@@ -16,3 +16,4 @@
 
 MIB_BYTES: int = 1 << 20
 GIB_BYTES: int = 1 << 30
+SUBLANE_ROWS: int = 8
