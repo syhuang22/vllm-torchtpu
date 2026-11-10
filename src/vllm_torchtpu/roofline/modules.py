@@ -91,6 +91,8 @@ class ModuleCost:
     collectives: tuple[Collective, ...] = ()
     hbm_bytes_min: float | None = None
     unique_collectives: tuple[tuple[Collective, int], ...] | None = None
+    fp8_flops_min: float | None = None
+    bf16_flops_min: float | None = None
 
     @property
     def ici_bytes(self) -> float:
@@ -115,6 +117,16 @@ class ModuleCost:
     def strict_hbm_bytes(self) -> float:
         """Strict lower-bound HBM bytes when available, else nominal HBM bytes."""
         return self.hbm_bytes if self.hbm_bytes_min is None else self.hbm_bytes_min
+
+    @property
+    def strict_fp8_flops(self) -> float:
+        """Unpadded lower-bound FP8 FLOPs when available, else nominal FP8 FLOPs."""
+        return self.fp8_flops if self.fp8_flops_min is None else self.fp8_flops_min
+
+    @property
+    def strict_bf16_flops(self) -> float:
+        """Unpadded lower-bound BF16 FLOPs when available, else nominal BF16 FLOPs."""
+        return self.bf16_flops if self.bf16_flops_min is None else self.bf16_flops_min
 
 
 def experts_touched(num_experts: int, top_k: int, rows: int) -> float:
@@ -1073,6 +1085,8 @@ def _compute_routed_moe_cost(
     r_fp8, r_bf16 = _split_matmul_flops(
         routed_rows, routed_act_elems, dt.w_expert, dt.act
     )
+    r_fp8_min = r_fp8
+    r_bf16_min = r_bf16
     if ctx.mxu_m_tile > 1 and routed_rows > 0 and ed > 0.0 and geom.top_k > 0:
         ed_global = (
             experts_touched(geom.num_experts, geom.top_k, routed_rows)
@@ -1106,6 +1120,8 @@ def _compute_routed_moe_cost(
         collectives=moe_colls,
         hbm_bytes_min=moe_w_bytes_min,
         unique_collectives=moe_ucolls,
+        fp8_flops_min=r_fp8_min + s_fp8 + rt_fp8,
+        bf16_flops_min=r_bf16_min + s_bf16 + rt_bf16,
     )
 
 

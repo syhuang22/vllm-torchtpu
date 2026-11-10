@@ -167,9 +167,9 @@ def test_emit_launch_args_mixed_and_disagg() -> None:
         total_chips=4,
         prefill_pool=None,
         decode_pool=mixed_pool,
-        p90_ttft_ms=180.0,
-        p90_tpot_ms=12.0,
-        p90_interactivity_tok_s=83.3,
+        est_ttft_ms=180.0,
+        est_tpot_ms=12.0,
+        est_interactivity_tok_s=83.3,
         output_throughput_per_chip=320.0,
         token_throughput_per_chip=2880.0,
         p_mixed=0.15,
@@ -216,9 +216,9 @@ def test_emit_launch_args_mixed_and_disagg() -> None:
         total_chips=20,
         prefill_pool=prefill_pool,
         decode_pool=decode_pool,
-        p90_ttft_ms=140.0,
-        p90_tpot_ms=9.5,
-        p90_interactivity_tok_s=105.2,
+        est_ttft_ms=140.0,
+        est_tpot_ms=9.5,
+        est_interactivity_tok_s=105.2,
         output_throughput_per_chip=336.8,
         token_throughput_per_chip=3031.2,
         p_mixed=0.0,
@@ -324,11 +324,11 @@ def test_emit_ceiling_rows_and_cli_subcommands(
     rows = emit_ceiling_rows(splan)
     assert len(rows) >= 1
     assert list(rows[0].keys())[:5] == [
-        "p90_interactivity_tok_s",
+        "est_interactivity_tok_s",
         "token_throughput_per_chip",
         "output_throughput_per_chip",
-        "p90_ttft_ms",
-        "p90_tpot_ms",
+        "est_ttft_ms",
+        "est_tpot_ms",
     ]
 
     cfg_path = tmp_path / "config.json"
@@ -375,7 +375,7 @@ def test_emit_ceiling_rows_and_cli_subcommands(
     out_ceil = json.loads(capsys.readouterr().out)
     assert rc_ceil == 0
     assert len(out_ceil) >= 1
-    assert "p90_interactivity_tok_s" in out_ceil[0]
+    assert "est_interactivity_tok_s" in out_ceil[0]
 
 
 def test_top_layouts_distinct_and_led_by_recommended() -> None:
@@ -563,7 +563,7 @@ def test_resident_batch_cap_emits_max_num_seqs_without_tput_inflation() -> None:
     assert pt_256.token_throughput_per_chip == pytest.approx(
         pt_15.token_throughput_per_chip, rel=1e-6
     )
-    assert pt_256.p90_ttft_ms > pt_15.p90_ttft_ms
+    assert pt_256.est_ttft_ms > pt_15.est_ttft_ms
 
 
 def test_top_layouts_structural_diversity_and_interactivity_anchor() -> None:
@@ -598,9 +598,9 @@ def test_top_layouts_structural_diversity_and_interactivity_anchor() -> None:
             total_chips=8,
             prefill_pool=None,
             decode_pool=pool,
-            p90_ttft_ms=100.0,
-            p90_tpot_ms=1000.0 / inter,
-            p90_interactivity_tok_s=inter,
+            est_ttft_ms=100.0,
+            est_tpot_ms=1000.0 / inter,
+            est_interactivity_tok_s=inter,
             output_throughput_per_chip=tput * 0.1,
             token_throughput_per_chip=tput,
             p_mixed=0.05,
@@ -675,9 +675,9 @@ def test_emit_omits_mtp_speculative_config_when_mtp_layers_zero() -> None:
         total_chips=8,
         prefill_pool=None,
         decode_pool=pool,
-        p90_ttft_ms=50.0,
-        p90_tpot_ms=20.0,
-        p90_interactivity_tok_s=50.0,
+        est_ttft_ms=50.0,
+        est_tpot_ms=20.0,
+        est_interactivity_tok_s=50.0,
         output_throughput_per_chip=100.0,
         token_throughput_per_chip=1000.0,
         p_mixed=0.0,

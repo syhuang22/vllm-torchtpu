@@ -224,8 +224,8 @@ def _check_mixed_prefill_dp2(chip: rf.ChipSpec) -> None:
         rf.Dtypes(kv=1.0),
         topology=rf.TOPOLOGIES["1x1x1"],
     )
-    assert sf_d_dp2.serial_floor_s > 0.0
-    assert sf_m_dp2.serial_floor_s > 0.0
+    assert sf_d_dp2.serial_estimate_s > 0.0
+    assert sf_m_dp2.serial_estimate_s > 0.0
     exp_p_mix = float(4 * 2) / float(512 + 4 * 2)
     assert dp2_plan.recommended.p_mixed == pytest.approx(exp_p_mix, rel=1e-5)
 
@@ -329,10 +329,10 @@ def _check_pp_prefill_ttft(chip: rf.ChipSpec) -> None:
             and p.decode_pool.topology == p0.decode_pool.topology
         )
         if p0.prefill_pool.ep <= 1:
-            assert p0_inf.p90_ttft_ms == pytest.approx(
-                sf_st.serial_floor_s * bubble_mult * 1e3, rel=1e-4
+            assert p0_inf.est_ttft_ms == pytest.approx(
+                sf_st.serial_estimate_s * bubble_mult * 1e3, rel=1e-4
             )
-        assert p0.p90_ttft_ms > p0_inf.p90_ttft_ms
+        assert p0.est_ttft_ms > p0_inf.est_ttft_ms
 
 
 def test_solver_hybrid_moe_mixed_vs_disagg_and_crossover(
@@ -379,8 +379,8 @@ def test_solver_hybrid_moe_mixed_vs_disagg_and_crossover(
         rf.Dtypes(kv=1.0),
         topology=rf.TOPOLOGIES[rec_d.topology],
     )
-    assert ca_plan.recommended.p90_tpot_ms == pytest.approx(
-        sf_k3.serial_floor_s * 1e3 / ca_scen.accept_len, rel=1e-4
+    assert ca_plan.recommended.est_tpot_ms == pytest.approx(
+        sf_k3.serial_estimate_s * 1e3 / ca_scen.accept_len, rel=1e-4
     )
 
     _check_dp_moe_decode(chip, q35_geom)
@@ -437,7 +437,7 @@ def test_solver_hybrid_moe_mixed_vs_disagg_and_crossover(
         hybrid_2t_dt,
         topology=topo_32,
     )
-    assert sf_tp32_c4.serial_floor_s < sf_dp4_c4.serial_floor_s
+    assert sf_tp32_c4.serial_estimate_s < sf_dp4_c4.serial_estimate_s
 
     sf_tp32_c256 = rf.step_floor(
         hybrid_2t_geom,
@@ -455,7 +455,7 @@ def test_solver_hybrid_moe_mixed_vs_disagg_and_crossover(
         hybrid_2t_dt,
         topology=topo_32,
     )
-    assert sf_dp4_c256.serial_floor_s < sf_tp32_c256.serial_floor_s
+    assert sf_dp4_c256.serial_estimate_s < sf_tp32_c256.serial_estimate_s
 
     gpt_oss_cfg = {
         "hidden_size": 2880,
@@ -624,7 +624,7 @@ def test_physical_kv_page_capacity_and_unpruned_regimes() -> None:
         and p.decode_pool.ep == 1
         and p.decode_pool.max_num_seqs is None
     ]
-    best_tp16 = min(tp16_pts, key=lambda p: p.p90_tpot_ms)
+    best_tp16 = min(tp16_pts, key=lambda p: p.est_tpot_ms)
     assert best_tp16.decode_pool.kv_split == _KV_SPLIT_16
 
     w4_dsa_geom = dc_replace(
@@ -679,7 +679,7 @@ def test_physical_kv_page_capacity_and_unpruned_regimes() -> None:
     ]
     assert tp2_dp8
     assert tp1_dp16
-    assert min(p.p90_tpot_ms for p in tp2_dp8) < min(p.p90_tpot_ms for p in tp1_dp16)
+    assert min(p.est_tpot_ms for p in tp2_dp8) < min(p.est_tpot_ms for p in tp1_dp16)
 
 
 def test_engine_memory_utilization_and_explicit_scenario_inputs(tmp_path: Path) -> None:
@@ -759,7 +759,7 @@ def test_engine_memory_utilization_and_explicit_scenario_inputs(tmp_path: Path) 
     )
     assert p_c0.recommended is not None
     assert p_think.recommended is not None
-    assert p_think.recommended.p90_tpot_ms <= p_c0.recommended.p90_tpot_ms
+    assert p_think.recommended.est_tpot_ms <= p_c0.recommended.est_tpot_ms
 
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps(QWEN35_CFG))
@@ -924,7 +924,7 @@ def test_decode_floor_matches_binding() -> None:
         expected_hard = max(
             df.hbm_ms, df.matmul_ms, df.ici_ms, df.chain_ms, df.hop_latency_ms
         )
-        assert math.isclose(df.hard_floor_ms, expected_hard, rel_tol=1e-5)
+        assert df.hard_floor_ms <= expected_hard + 1e-9
         if df.binding == "hbm":
             assert math.isclose(df.hbm_ms, df.hard_floor_ms, rel_tol=1e-5)
         elif df.binding == "matmul":
@@ -1080,7 +1080,7 @@ def test_disagg_capacity_clamped_hit_rate_and_prefill_dispatch() -> None:
             matched += 1
             assert pt_s.kv_cache_capacity_tokens is not None
             assert pt_h.effective_prefix_hit_rate < pt_s.effective_prefix_hit_rate
-            assert pt_h.p90_ttft_ms > pt_s.p90_ttft_ms
+            assert pt_h.est_ttft_ms > pt_s.est_ttft_ms
     assert matched >= 1
     pcp_ep_pts = [
         p
@@ -1331,7 +1331,7 @@ def test_fast_pass_memo_matches_step_and_spec_cycle_floors() -> None:
         sf_pre_direct = _scale_ep_moe_floor(sf_pre_direct, chip, geom, par, eff_pre)
     if par.pp > 1:
         sf_pre_direct = _scale_pp_stage_floor(sf_pre_direct, pp_part, chip, par, topo)
-    assert pre_sf == pytest.approx(sf_pre_direct.serial_floor_s)
+    assert pre_sf == pytest.approx(sf_pre_direct.serial_estimate_s)
 
     dec_sf, draft_s = planner.get_dec_sf(pid, 4)
     sf_dec_direct = spec_cycle_floor(
@@ -1357,8 +1357,10 @@ def test_fast_pass_memo_matches_step_and_spec_cycle_floors() -> None:
         tot_tok = 4 * (planner.spec_k + 1)
         sf_dec_direct = _scale_ep_moe_floor(sf_dec_direct, chip, geom, par, tot_tok)
         sf_ver_direct = _scale_ep_moe_floor(sf_ver_direct, chip, geom, par, tot_tok)
-    exp_draft = max(0.0, sf_dec_direct.serial_floor_s - sf_ver_direct.serial_floor_s)
-    assert dec_sf == pytest.approx(sf_dec_direct.serial_floor_s)
+    exp_draft = max(
+        0.0, sf_dec_direct.serial_estimate_s - sf_ver_direct.serial_estimate_s
+    )
+    assert dec_sf == pytest.approx(sf_dec_direct.serial_estimate_s)
     assert draft_s == pytest.approx(exp_draft)
 
     mix_sf = planner.compute_mix_sf(pid, 4, 512)
@@ -1454,7 +1456,7 @@ def test_asymmetric_pp_partition_emits_vllm_pp_layer_partition() -> None:
         dt,
         topology=TOPOLOGIES["1x2x1"],
     )
-    assert pt_pp2.p90_ttft_ms > sf_even.serial_floor_s * 1.5 * 1e3
+    assert pt_pp2.est_ttft_ms > sf_even.serial_estimate_s * 1.5 * 1e3
     launch = point_launch_args(pt_pp2, model="org/synth-hybrid")
     assert (
         "VLLM_PP_LAYER_PARTITION=7,1 vllm serve org/synth-hybrid"
@@ -1569,7 +1571,7 @@ def test_prefill_logit_hbm_bound_and_disagg_dcn_transfer_floor() -> None:
     assert disagg_fast.recommended is not None
     assert disagg_slow.recommended is not None
     assert (
-        disagg_slow.recommended.p90_ttft_ms > disagg_fast.recommended.p90_ttft_ms + 5.0
+        disagg_slow.recommended.est_ttft_ms > disagg_fast.recommended.est_ttft_ms + 5.0
     )
 
 
@@ -1670,7 +1672,7 @@ def test_prefix_hit_crossover_sweep_and_pcie_offload() -> None:
     pt_slow_pcie = next(
         p for p in slow_pcie_plan.candidates if p.decode_pool.tp == _TARGET_TP_8
     )
-    assert pt_slow_pcie.p90_ttft_ms > pt_yes.p90_ttft_ms
+    assert pt_slow_pcie.est_ttft_ms > pt_yes.est_ttft_ms
 
     disagg_fast_pcie = solve_serving_plan(
         geom, dt, chip, scen_offload, mode="disagg", max_chips=8
@@ -1686,8 +1688,8 @@ def test_prefix_hit_crossover_sweep_and_pcie_offload() -> None:
     assert disagg_fast_pcie.recommended is not None
     assert disagg_slow_pcie.recommended is not None
     assert (
-        disagg_slow_pcie.recommended.p90_ttft_ms
-        > disagg_fast_pcie.recommended.p90_ttft_ms
+        disagg_slow_pcie.recommended.est_ttft_ms
+        > disagg_fast_pcie.recommended.est_ttft_ms
     )
 
     emitted = emit_launch_args(plan_yes, dtypes=dt, model="org/synth-moe")
@@ -1735,7 +1737,7 @@ def test_prefix_hit_crossover_sweep_slo_probe_and_examples() -> None:
     assert probe_h0.recommended is not None
     assert probe_h95.recommended is not None
     mid_ttft_slo = 0.5 * (
-        probe_h0.recommended.p90_ttft_ms + probe_h95.recommended.p90_ttft_ms
+        probe_h0.recommended.est_ttft_ms + probe_h95.recommended.est_ttft_ms
     )
     scen_slo = dc_replace(scen_probe, ttft_slo_ms=mid_ttft_slo)
     plan_slo_h0 = solve_serving_plan(
@@ -1780,3 +1782,15 @@ def test_prefix_hit_crossover_sweep_slo_probe_and_examples() -> None:
                 ex_plan.winner_prefix_hit_range,
                 ex_plan.prefix_hit_crossover_rate,
             )
+
+
+_EP_Z_4: float = 1.029375373003964
+_EP_Z_8: float = 1.4236003060452778
+_EP_Z_16: float = 1.765991393054788
+
+
+def test_ep_expected_maximum_matches_quadrature() -> None:
+    """Verify _ep_z_unit matches exact Gaussian quadrature for ep=4,8,16."""
+    assert solver._ep_z_unit(4) == pytest.approx(_EP_Z_4, rel=1e-12)
+    assert solver._ep_z_unit(8) == pytest.approx(_EP_Z_8, rel=1e-12)
+    assert solver._ep_z_unit(16) == pytest.approx(_EP_Z_16, rel=1e-12)

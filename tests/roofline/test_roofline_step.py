@@ -105,7 +105,6 @@ def test_hard_floor_is_max_of_resources() -> None:
         StepShape(batch=1, rows_per_seq=1, context=90036),
         DOC_DTYPES,
     )
-    assert sf.hard_floor_s == max(sf.hbm_s, sf.mm_s, sf.ici_s)
     assert sf.binding == "hbm"
     assert sf.hbm_s == pytest.approx(3_859_025_920 / 3.7e12, rel=1e-12)
     sf_unpad = step_floor(
@@ -181,8 +180,8 @@ def test_chain_term_binds_with_latency() -> None:
         sf0.chain_s + expected_hops * EXAMPLE_COLLECTIVE_LATENCY_S, rel=1e-6
     )
     assert sf1.hard_floor_s == sf0.hard_floor_s
-    assert sf1.serial_floor_s == pytest.approx(
-        sf0.serial_floor_s + expected_hops * EXAMPLE_COLLECTIVE_LATENCY_S, rel=1e-6
+    assert sf1.serial_estimate_s == pytest.approx(
+        sf0.serial_estimate_s + expected_hops * EXAMPLE_COLLECTIVE_LATENCY_S, rel=1e-6
     )
 
 
@@ -455,7 +454,7 @@ def test_pcp_dcp_mutual_exclusion_and_mixed_step() -> None:
         StepShape(batch=16, rows_per_seq=1, context=8192, prefill_tokens=2048),
         dt=EXAMPLE_FP8_DTYPES,
     )
-    assert sf_mix.serial_floor_s > sf_dec.serial_floor_s * 1.5
+    assert sf_mix.serial_estimate_s > sf_dec.serial_estimate_s * 1.5
 
 
 def test_slice_topology_wraparound_and_d2d_ar_floor() -> None:
@@ -567,9 +566,9 @@ def test_dependent_collectives_latency_bound() -> None:
     sf = step_floor(geom, inf_chip, par, shape, Dtypes(), topology=TOPOLOGIES["2x2x1"])
     assert sf.resource_bound_s < _RESOURCE_BOUND_EPS
     assert sf.latency_bound_s > 0.0
-    assert sf.hard_floor_s == pytest.approx(sf.latency_bound_s, rel=1e-12)
-    assert sf.hard_floor_s == max(sf.resource_bound_s, sf.latency_bound_s, sf.chain_s)
-    assert sf.binding == "chain"
+    assert sf.hard_floor_s < _RESOURCE_BOUND_EPS
+    assert sf.latency_assumed_s == pytest.approx(sf.latency_bound_s, rel=1e-12)
+    assert sf.serial_estimate_s >= sf.latency_bound_s
 
 
 def test_mla_and_ple_missing_field_validations() -> None:
@@ -751,3 +750,96 @@ def test_block_parallel_and_multilayer_mtp_draft_cost() -> None:
         replace(geom_bp, mtp_inter=0), dt, par, 1, 1024
     )
     assert bd_mtp2.weights < bd_moe.weights
+
+
+_DECODE_BATCH_8: int = 8
+_HIGH_HOP_LAT_S: float = 100.0e-6
+
+
+def test_bound_never_exceeds_estimate_across_families() -> None:
+    """Verify hard_floor_s never exceeds serial_estimate_s and excludes
+    assumed hop latency."""
+    chip = CHIPS["tpu7x"]
+    chip_high_lat = replace(chip, ici_hop_latency_s=_HIGH_HOP_LAT_S)
+    topo = TOPOLOGIES["2x2x1"]
+    configs = [
+        QWEN35_CFG,
+        {
+            "hidden_size": 2048,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "intermediate_size": 4096,
+            "vocab_size": 32000,
+        },
+        {
+            "hidden_size": 2048,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "kv_lora_rank": 512,
+            "q_lora_rank": 1024,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 0,
+            "v_head_dim": 128,
+            "intermediate_size": 4096,
+            "vocab_size": 32000,
+        },
+    ]
+    for cfg in configs:
+        geom = from_hf_config(cfg)
+        for shape in (
+            StepShape(batch=1, rows_per_seq=1, context=4096),
+            StepShape(batch=_DECODE_BATCH_8, rows_per_seq=1, context=4096),
+            StepShape(
+                batch=0,
+                rows_per_seq=0,
+                context=0,
+                state_writes=0,
+                prefill_tokens=2048,
+            ),
+        ):
+            for t in (None, topo):
+                sf = step_floor(
+                    geom, chip, Parallel(tp=8), shape, DOC_DTYPES, topology=t
+                )
+                sf_hi = step_floor(
+                    geom,
+                    chip_high_lat,
+                    Parallel(tp=8),
+                    shape,
+                    DOC_DTYPES,
+                    topology=t,
+                )
+                assert sf.hbm_bound_s <= sf.hbm_s + 1e-12
+                assert sf.mm_bound_s <= sf.mm_s + 1e-12
+                assert sf.coll_bound_s <= sf.chain_s + 1e-12
+                assert sf.hard_floor_s == pytest.approx(
+                    max(sf.hbm_bound_s, sf.mm_bound_s, sf.coll_bound_s),
+                    rel=1e-12,
+                )
+                assert sf.hard_floor_s <= sf.serial_estimate_s + 1e-12
+                assert sf_hi.hard_floor_s == pytest.approx(sf.hard_floor_s, rel=1e-12)
+                if sf.lat_s > 0.0:
+                    assert sf_hi.latency_assumed_s > sf.latency_assumed_s
+
+
+def test_single_expert_routing_cannot_beat_bound() -> None:
+    """Verify best-case single-expert routing time at batch 8 is >= hard_floor_s."""
+    geom = from_hf_config(QWEN35_CFG)
+    chip = CHIPS["tpu7x"]
+    dt = rf.dtypes_from_hf_config(QWEN35_CFG)
+    shape = StepShape(batch=_DECODE_BATCH_8, rows_per_seq=1, context=90036)
+    sf = step_floor(
+        geom,
+        chip,
+        Parallel(tp=8),
+        shape,
+        dt,
+        topology=TOPOLOGIES["2x2x1"],
+    )
+    single_expert_hbm_s = sum(m.strict_hbm_bytes for m in sf.modules) / chip.hbm_bw
+    assert single_expert_hbm_s == pytest.approx(0.004218697340540541, rel=1e-9)
+    assert single_expert_hbm_s >= sf.hard_floor_s - 1e-15
+    assert sf.mm_bound_s == pytest.approx(6.861009232900433e-05, rel=1e-9)

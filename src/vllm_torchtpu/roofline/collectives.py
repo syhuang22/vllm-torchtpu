@@ -225,3 +225,52 @@ def torus_collective_s(
     xfer = payload_bytes if kind == "push" else payload_bytes * (group - 1) / group
     phase_s = max(lat_1p, xfer / eff_bw)
     return 2.0 * phase_s if kind == "ar" else phase_s
+
+
+def collective_cut_bound_s(
+    kind: Kind,
+    payload_bytes: float,
+    submesh_axes: tuple[int, int, int, int],
+    chip: ChipSpec,
+    topology: SliceTopology | None = None,
+) -> float:
+    """Physical cut-set lower bound in seconds for one collective."""
+    d2d, ax, ay, az = submesh_axes
+    g = d2d * ax * ay * az
+    if g <= 1 or payload_bytes <= 0.0:
+        return 0.0
+    if not (chip.ici_bw > 0.0 and math.isfinite(chip.ici_bw)):
+        return 0.0
+    if ax * ay * az == 1:
+        if kind == "ag":
+            rx_bytes = payload_bytes * float(g - 1) / float(g)
+        elif kind == "rs":
+            rx_bytes = payload_bytes / float(g)
+        else:
+            rx_bytes = payload_bytes
+        d2d_rate = (
+            chip.d2d_bw
+            if chip.d2d_bw > 0.0 and math.isfinite(chip.d2d_bw)
+            else chip.ici_bw * float(chip.cores_per_chip)
+        )
+        return rx_bytes / d2d_rate
+    r = max(1, min(g, d2d))
+    if kind == "ag":
+        rx_bytes = payload_bytes * float(max(0, g - r)) / float(g)
+    elif kind == "rs":
+        rx_bytes = payload_bytes * float(r) / float(g)
+    else:
+        rx_bytes = payload_bytes
+    links_in = 0
+    for axis_idx, ext in enumerate((ax, ay, az)):
+        if ext <= 1:
+            continue
+        if (
+            ext > _DEFAULT_RANKS_PER_CHIP
+            and topology is not None
+            and topology.axis_wrapped(axis_idx, ext)
+        ):
+            links_in += 2
+        else:
+            links_in += 1
+    return rx_bytes / (float(max(1, links_in)) * chip.ici_link_bw)

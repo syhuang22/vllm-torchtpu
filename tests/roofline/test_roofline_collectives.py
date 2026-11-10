@@ -23,6 +23,7 @@ from vllm_torchtpu.roofline import (
     submesh_for_group,
     torus_collective_s,
 )
+from vllm_torchtpu.roofline import collectives as rf_collectives
 
 _EXPECTED_LINK_BW: float = 100.0e9
 _EXPECTED_ICI_BW: float = 300.0e9
@@ -58,3 +59,28 @@ def test_spec_cited_chip_and_unloaded_hop_latency() -> None:
     assert torus_collective_s(
         "ar", 16.0, (2, 2, 2, 1), chip, TOPOLOGIES["2x2x1"]
     ) == pytest.approx(2 * 2 * _EXPECTED_HOP_LATENCY)
+
+
+_FEASIBLE_CUT_BOUND_S: float = 0.00033554432
+
+
+def test_collective_bound_at_or_below_feasible_schedule() -> None:
+    """Verify collective cut bound is 0.33554432 ms on 2x2x1 and below
+    feasible schedule."""
+    chip = CHIPS["tpu7x"]
+    topo = TOPOLOGIES["2x2x1"]
+    submesh = submesh_for_group(8, topo, 2)
+    feasible_s = (
+        _PAYLOAD_BYTES / chip.d2d_bw
+        + _PAYLOAD_BYTES / chip.ici_link_bw
+        + _PAYLOAD_BYTES / chip.d2d_bw
+    )
+    cut_s = topo and submesh and (_PAYLOAD_BYTES / (2.0 * chip.ici_link_bw))
+    bound_s = rf_collectives.collective_cut_bound_s(
+        "ar", _PAYLOAD_BYTES, submesh, chip, topo
+    )
+    est_s = torus_collective_s("ar", _PAYLOAD_BYTES, submesh, chip, topo)
+    assert bound_s == pytest.approx(_FEASIBLE_CUT_BOUND_S, rel=1e-12)
+    assert bound_s == pytest.approx(cut_s, rel=1e-12)
+    assert bound_s <= feasible_s
+    assert feasible_s <= est_s

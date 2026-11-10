@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from .modules import Dtypes
     from .solver import ParetoPoint, PoolMeshPlan, ServingPlan
 
-SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v1"
+SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v2"
 _MIN_TOP_LAYOUTS_FOR_FASTEST: int = 2
 
 
@@ -123,10 +123,10 @@ def top_layouts(plan: ServingPlan, k: int = 3) -> tuple[ParetoPoint, ...]:
         cur = best.get(key)
         if cur is None or (
             pt.token_throughput_per_chip,
-            pt.p90_interactivity_tok_s,
+            pt.est_interactivity_tok_s,
         ) > (
             cur.token_throughput_per_chip,
-            cur.p90_interactivity_tok_s,
+            cur.est_interactivity_tok_s,
         ):
             best[key] = pt
     ranked = sorted(best.values(), key=lambda p: -p.token_throughput_per_chip)
@@ -135,7 +135,7 @@ def top_layouts(plan: ServingPlan, k: int = 3) -> tuple[ParetoPoint, ...]:
     selected = list(ranked[:k])
     fastest = max(
         slo_cands,
-        key=lambda p: (p.p90_interactivity_tok_s, p.token_throughput_per_chip),
+        key=lambda p: (p.est_interactivity_tok_s, p.token_throughput_per_chip),
     )
     f_key = (
         fastest.mode,
@@ -278,7 +278,10 @@ def build_solve_payload(
     payload["schema"] = SOLVE_SCHEMA
     payload["provenance"] = {
         "calibrated": False,
-        "basis": "analytical roofline floors; p90 values are modeled, not measured",
+        "basis": (
+            "analytical roofline bounds and estimates; est_* values are "
+            "modeled estimates, bound_* values are physical lower bounds"
+        ),
     }
     chip_dict = asdict(chip)
     chip_dict["jax_version"] = JAX_VERSION
@@ -291,7 +294,7 @@ def build_solve_payload(
         max(
             range(len(top_pts)),
             key=lambda i: (
-                top_pts[i].p90_interactivity_tok_s,
+                top_pts[i].est_interactivity_tok_s,
                 top_pts[i].token_throughput_per_chip,
             ),
         )
@@ -332,11 +335,12 @@ def emit_ceiling_rows(plan: ServingPlan) -> list[dict[str, Any]]:
     """Export Pareto ceiling rows leading with p90 interactivity and throughput."""
     return [
         {
-            "p90_interactivity_tok_s": pt.p90_interactivity_tok_s,
+            "est_interactivity_tok_s": pt.est_interactivity_tok_s,
             "token_throughput_per_chip": pt.token_throughput_per_chip,
             "output_throughput_per_chip": pt.output_throughput_per_chip,
-            "p90_ttft_ms": pt.p90_ttft_ms,
-            "p90_tpot_ms": pt.p90_tpot_ms,
+            "est_ttft_ms": pt.est_ttft_ms,
+            "est_tpot_ms": pt.est_tpot_ms,
+            "bound_tpot_ms": pt.bound_tpot_ms,
             "concurrency": pt.concurrency,
             "total_chips": pt.total_chips,
             "mode": pt.mode,

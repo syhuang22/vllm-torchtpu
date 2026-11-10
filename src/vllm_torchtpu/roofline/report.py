@@ -62,7 +62,7 @@ def _render_frontier_svg(
         )
 
     max_x = max(p.get("token_throughput_per_chip", 0.0) for p in all_pts) or 1.0
-    max_y = max(p.get("p90_interactivity_tok_s", 0.0) for p in all_pts) or 1.0
+    max_y = max(p.get("est_interactivity_tok_s", 0.0) for p in all_pts) or 1.0
     max_x *= 1.15
     max_y *= 1.15
 
@@ -90,7 +90,7 @@ def _render_frontier_svg(
         f'<text x="18" y="{pad_top + plot_h // 2}" text-anchor="middle" '
         'font-size="12" fill="#475569" '
         f'transform="rotate(-90, 18, {pad_top + plot_h // 2})">'
-        "p90 Interactivity (tok/s)</text>",
+        "Est. Interactivity (tok/s)</text>",
     ]
 
     for i in range(5):
@@ -117,11 +117,11 @@ def _render_frontier_svg(
 
     for p in all_pts:
         cx = scale_x(p.get("token_throughput_per_chip", 0.0))
-        cy = scale_y(p.get("p90_interactivity_tok_s", 0.0))
+        cy = scale_y(p.get("est_interactivity_tok_s", 0.0))
         t_tip = (
             f"c={p.get('concurrency', 1)} | "
             f"{p.get('token_throughput_per_chip', 0.0):.1f} tok/s/chip | "
-            f"{p.get('p90_interactivity_tok_s', 0.0):.1f} tok/s"
+            f"{p.get('est_interactivity_tok_s', 0.0):.1f} tok/s"
         )
         svg_parts.append(
             f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="3" fill="#cbd5e1" '
@@ -133,7 +133,7 @@ def _render_frontier_svg(
     if len(sorted_f) >= _MIN_FRONTIER_POINTS_FOR_POLYLINE:
         poly_pts = " ".join(
             f"{scale_x(p.get('token_throughput_per_chip', 0.0)):.1f},"
-            f"{scale_y(p.get('p90_interactivity_tok_s', 0.0)):.1f}"
+            f"{scale_y(p.get('est_interactivity_tok_s', 0.0)):.1f}"
             for p in sorted_f
         )
         svg_parts.append(
@@ -143,13 +143,13 @@ def _render_frontier_svg(
 
     for p in sorted_f:
         cx = scale_x(p.get("token_throughput_per_chip", 0.0))
-        cy = scale_y(p.get("p90_interactivity_tok_s", 0.0))
+        cy = scale_y(p.get("est_interactivity_tok_s", 0.0))
         f_tip = (
             f"Frontier: c={p.get('concurrency', 1)} | "
             f"{p.get('token_throughput_per_chip', 0.0):.1f} tok/s/chip | "
-            f"{p.get('p90_interactivity_tok_s', 0.0):.1f} tok/s | "
-            f"TTFT: {p.get('p90_ttft_ms', 0.0):.1f}ms | "
-            f"TPOT: {p.get('p90_tpot_ms', 0.0):.2f}ms"
+            f"{p.get('est_interactivity_tok_s', 0.0):.1f} tok/s | "
+            f"TTFT: {p.get('est_ttft_ms', 0.0):.1f}ms | "
+            f"TPOT: {p.get('est_tpot_ms', 0.0):.2f}ms"
         )
         svg_parts.append(
             f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="5.5" fill="#1d4ed8" '
@@ -521,9 +521,9 @@ def _extract_recommended_view(
             "chips": rec.get("total_chips", 0),
             "concurrency": rec.get("concurrency", 1),
             "tput": f"{rec.get('token_throughput_per_chip', 0.0):.1f}",
-            "interactivity": f"{rec.get('p90_interactivity_tok_s', 0.0):.1f}",
-            "ttft": f"{rec.get('p90_ttft_ms', 0.0):.1f}",
-            "tpot": f"{rec.get('p90_tpot_ms', 0.0):.2f}",
+            "interactivity": f"{rec.get('est_interactivity_tok_s', 0.0):.1f}",
+            "ttft": f"{rec.get('est_ttft_ms', 0.0):.1f}",
+            "tpot": f"{rec.get('est_tpot_ms', 0.0):.2f}",
             "binding": str(rec.get("binding", "hbm")),
             "decode_floor": rec.get("decode_floor"),
         }
@@ -584,10 +584,10 @@ def _render_table_rows(top_k: list[dict[str, Any]]) -> str:
         mode_val = pt.get("mode", "")
         c_val = pt.get("concurrency", 1)
         chips_val = pt.get("total_chips", 0)
-        int_val = f"{pt.get('p90_interactivity_tok_s', 0.0):.1f}"
+        int_val = f"{pt.get('est_interactivity_tok_s', 0.0):.1f}"
         tput_val = f"{pt.get('token_throughput_per_chip', 0.0):.1f}"
-        ttft_val = f"{pt.get('p90_ttft_ms', 0.0):.1f}"
-        tpot_val = f"{pt.get('p90_tpot_ms', 0.0):.2f}"
+        ttft_val = f"{pt.get('est_ttft_ms', 0.0):.1f}"
+        tpot_val = f"{pt.get('est_tpot_ms', 0.0):.2f}"
         cap_raw = pt.get("kv_cache_capacity_tokens")
         cap_str = f"{int(cap_raw):,}" if cap_raw is not None else "inf"
         eff_hit = float(pt.get("effective_prefix_hit_rate", 0.0))
@@ -820,19 +820,19 @@ def render_html(payload: dict[str, Any]) -> str:
         "tok/s/chip</span></div>",
         "      </div>",
         '      <div class="stat-box">',
-        '        <div class="stat-label">p90 Interactivity</div>',
+        '        <div class="stat-label">Est. Interactivity</div>',
         f'        <div class="stat-value">{rec_int} '
         '<span style="font-size:12px; font-weight:normal; color:#64748b;">'
         "tok/s</span></div>",
         "      </div>",
         '      <div class="stat-box">',
-        '        <div class="stat-label">p90 TTFT</div>',
+        '        <div class="stat-label">Est. TTFT</div>',
         f'        <div class="stat-value">{rec_ttft} '
         '<span style="font-size:12px; font-weight:normal; color:#64748b;">'
         "ms</span></div>",
         "      </div>",
         '      <div class="stat-box">',
-        '        <div class="stat-label">p90 TPOT</div>',
+        '        <div class="stat-label">Est. TPOT</div>',
         f'        <div class="stat-value">{rec_tpot} '
         '<span style="font-size:12px; font-weight:normal; color:#64748b;">'
         "ms</span></div>",

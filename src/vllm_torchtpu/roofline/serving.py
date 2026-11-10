@@ -108,7 +108,7 @@ def plan(
                 collective_latency_s=lat_s,
             )
         hard_ms = sf.hard_floor_s * 1e3
-        serial_ms = sf.serial_floor_s * 1e3
+        serial_ms = sf.serial_estimate_s * 1e3
         tpot_ms = hard_ms / tokens
         interactivity = 1000.0 / tpot_ms
         output_tput = (c * tokens) / sf.hard_floor_s / chips

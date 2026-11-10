@@ -288,14 +288,15 @@ class ParetoPoint:
     total_chips: int
     prefill_pool: PoolMeshPlan | None
     decode_pool: PoolMeshPlan
-    p90_ttft_ms: float
-    p90_tpot_ms: float
-    p90_interactivity_tok_s: float
+    est_ttft_ms: float
+    est_tpot_ms: float
+    est_interactivity_tok_s: float
     output_throughput_per_chip: float
     token_throughput_per_chip: float
     p_mixed: float
     binding: str
     slo_met: bool
+    bound_tpot_ms: float = 0.0
     decode_floor: FloorTimes | None = None
     kv_cache_capacity_tokens: int | None = None
     effective_prefix_hit_rate: float | None = None
@@ -838,11 +839,21 @@ def _count_full_attn_layers(geom: ModelGeometry) -> int:
 
 @lru_cache(maxsize=256)
 def _ep_z_unit(ep: int) -> float:
-    """Return the expected maximum of standard normal variables under EP."""
-    return (
-        1.0 / math.sqrt(math.pi)
-        if ep == _EP_PAIR
-        else _STD_NORM.inv_cdf(1.0 - 1.0 / float(ep))
+    """Return the exact expected maximum of ep standard normal variables."""
+    if ep <= 1:
+        return 0.0
+    if ep == _EP_PAIR:
+        return 1.0 / math.sqrt(math.pi)
+    step = 1e-3
+    n_steps = int(20.0 / step)
+    n_f = float(ep)
+    return sum(
+        (-10.0 + (float(i) + 0.5) * step)
+        * n_f
+        * _STD_NORM.pdf(-10.0 + (float(i) + 0.5) * step)
+        * (_STD_NORM.cdf(-10.0 + (float(i) + 0.5) * step) ** (ep - 1))
+        * step
+        for i in range(n_steps)
     )
 
 
@@ -861,55 +872,27 @@ def _scale_ep_moe_floor(
     geom: ModelGeometry,
     par: Parallel,
     global_tokens: int,
+    topology: SliceTopology | None = None,
 ) -> StepFloor:
-    """Scale EP MoE module flops and latency by the max EP load ratio."""
+    """Scale EP MoE module estimate FLOPs by max EP load ratio."""
     if par.ep <= 1 or geom.num_experts <= 0 or global_tokens <= 0:
         return sf
     ratio = max_ep_load_ratio(global_tokens * geom.top_k, par.ep)
     if ratio <= 1.0:
         return sf
     scaled = tuple(
-        replace(m, fp8_flops=m.fp8_flops * ratio, bf16_flops=m.bf16_flops * ratio)
+        replace(
+            m,
+            fp8_flops=m.fp8_flops * ratio,
+            bf16_flops=m.bf16_flops * ratio,
+            fp8_flops_min=m.strict_fp8_flops,
+            bf16_flops_min=m.strict_bf16_flops,
+        )
         if m.name in ("moe", "draft_moe")
         else m
         for m in sf.modules
     )
-    mm_s = (
-        sum(m.fp8_flops for m in scaled) / chip.fp8_flops
-        + sum(m.bf16_flops for m in scaled) / chip.bf16_flops
-    )
-    use_torus = par.mesh_axes is not None
-    resource_bound_s = max(sf.hbm_s, mm_s, sf.ici_s)
-    hard_floor_s = max(resource_bound_s, sf.lat_s, sf.chain_s)
-    serial_floor_s = (
-        sum(
-            max(
-                m.hbm_bytes / chip.hbm_bw,
-                m.fp8_flops / chip.fp8_flops + m.bf16_flops / chip.bf16_flops,
-            )
-            for m in scaled
-        )
-        + sf.chain_s
-    )
-    if hard_floor_s == sf.hbm_s:
-        binding = "hbm"
-    elif hard_floor_s == mm_s:
-        binding = "matmul"
-    elif hard_floor_s > sf.ici_s or use_torus or sf.lat_s > sf.ici_s:
-        binding = "chain"
-    else:
-        binding = "ici"
-    return StepFloor(
-        modules=scaled,
-        hbm_s=sf.hbm_s,
-        mm_s=mm_s,
-        ici_s=sf.ici_s,
-        chain_s=sf.chain_s,
-        hard_floor_s=hard_floor_s,
-        serial_floor_s=serial_floor_s,
-        binding=binding,
-        lat_s=sf.lat_s,
-    )
+    return _combine_modules(scaled, chip, topology=topology, par=par)
 
 
 def _scaled_ep_serial_s(
@@ -921,10 +904,10 @@ def _scaled_ep_serial_s(
 ) -> float:
     """Compute serial execution latency of step floor scaled by EP routing imbalance."""
     if par.ep <= 1 or geom.num_experts <= 0 or global_tokens <= 0:
-        return sf.serial_floor_s
+        return sf.serial_estimate_s
     ratio = max_ep_load_ratio(global_tokens * geom.top_k, par.ep)
     if ratio <= 1.0:
-        return sf.serial_floor_s
+        return sf.serial_estimate_s
     mod_s = 0.0
     for m in sf.modules:
         mul = ratio if m.name in ("moe", "draft_moe") else 1.0
@@ -1436,7 +1419,7 @@ def _pareto_filter(points: Sequence[ParetoPoint]) -> tuple[ParetoPoint, ...]:
     ordered = sorted(
         points,
         key=lambda p: (
-            -p.p90_interactivity_tok_s,
+            -p.est_interactivity_tok_s,
             -p.token_throughput_per_chip,
             p.total_chips,
         ),
@@ -1579,7 +1562,7 @@ def _find_prefill_options(
                 topo,
             )
             ttft_ms = (
-                sf_p.serial_floor_s
+                sf_p.serial_estimate_s
                 * (1.0 + float(par.pp - 1) / float(max(1, ctx.n_chunks)))
                 * 1e3
             )
@@ -1593,7 +1576,7 @@ def _find_prefill_options(
                     * 1e3
                 )
                 min_req_ttft_ms = min(min_req_ttft_ms, ttft_ms + xfer_min_ms)
-            rate_p = 1.0 / max(1e-9, sf_p.serial_floor_s)
+            rate_p = 1.0 / max(1e-9, sf_p.serial_estimate_s)
             cls_key = (par.tp * par.pcp, par.pp > 1)
             prev = best_by_class.get(cls_key)
             if prev is None or rate_p > prev.rate_p:
@@ -1652,7 +1635,8 @@ def _evaluate_mixed_point(
                 )
             )
             w_srv = (
-                sf_ttft.serial_floor_s + dec_steps_per_req * sf_dec_tmp.serial_floor_s
+                sf_ttft.serial_estimate_s
+                + dec_steps_per_req * sf_dec_tmp.serial_estimate_s
             )
             c_act = float(c) * w_srv / (w_srv + ctx.scenario.think_time_s)
             b_local = max(1, math.ceil(c_act / max(1, par.dp)))
@@ -1750,7 +1734,7 @@ def _evaluate_mixed_point(
         if offload_read_b > 0.0 and pcie_core_bw > 0.0 and math.isfinite(pcie_core_bw)
         else 0.0
     )
-    pre_ttft_s = sf_ttft_c.serial_floor_s + pcie_read_s
+    pre_ttft_s = sf_ttft_c.serial_estimate_s + pcie_read_s
     eff_isl_c = max(1, math.ceil((1.0 - h_eff) * ctx.scenario.isl))
     n_chunks_c = max(1, math.ceil(eff_isl_c / max(1, ctx.scenario.prefill_chunk)))
     chunk_tok_c = min(eff_isl_c, ctx.scenario.prefill_chunk)
@@ -1792,7 +1776,7 @@ def _evaluate_mixed_point(
         if ctx.spec_k > 0
         else sf_dec
     )
-    draft_serial_s = max(0.0, sf_dec.serial_floor_s - sf_ver_only.serial_floor_s)
+    draft_serial_s = max(0.0, sf_dec.serial_estimate_s - sf_ver_only.serial_estimate_s)
     sf_mix = step_floor(
         ctx.geom,
         ctx.chip,
@@ -1808,15 +1792,15 @@ def _evaluate_mixed_point(
         ctx.dtypes,
         topology=topo,
     )
-    mix_serial_s = sf_mix.serial_floor_s + draft_serial_s
+    mix_serial_s = sf_mix.serial_estimate_s + draft_serial_s
     total_req_work_s = (
-        dec_steps_per_req * sf_dec.serial_floor_s
+        dec_steps_per_req * sf_dec.serial_estimate_s
         + float(b_res * n_chunks_c) * mix_serial_s
     )
     res_cap = float(b_res * max(1, par.dp))
     c_served = min(float(c), res_cap)
     server_cap_rate = res_cap / max(1e-9, total_req_work_s)
-    w_srv_final = pre_ttft_s + dec_steps_per_req * sf_dec.serial_floor_s
+    w_srv_final = pre_ttft_s + dec_steps_per_req * sf_dec.serial_estimate_s
     rate_req_s = (
         min(
             server_cap_rate,
@@ -1830,21 +1814,21 @@ def _evaluate_mixed_point(
         float(b_res * n_chunks_c)
         / float(max(1.0, dec_steps_per_req + float(b_res * n_chunks_c))),
     )
-    p90_step_s = (1.0 - p_mix) * sf_dec.serial_floor_s + p_mix * mix_serial_s
-    p90_tpot_ms = p90_step_s * 1e3 / ctx.eff_al
+    est_step_s = (1.0 - p_mix) * sf_dec.serial_estimate_s + p_mix * mix_serial_s
+    est_tpot_ms = est_step_s * 1e3 / ctx.eff_al
     c_demand = min(float(c), float(b_local * max(1, par.dp)))
     queue_wait_s = max(0.0, (c_demand / max(1e-9, res_cap)) - 1.0) * w_srv_final
-    p90_ttft_ms = (pre_ttft_s + queue_wait_s) * 1e3 + (
-        sf_mix.serial_floor_s * 1e3 if c > 1 else 0.0
+    est_ttft_ms = (pre_ttft_s + queue_wait_s) * 1e3 + (
+        sf_mix.serial_estimate_s * 1e3 if c > 1 else 0.0
     )
-    interactivity = 1000.0 / max(1e-6, p90_tpot_ms)
+    interactivity = 1000.0 / max(1e-6, est_tpot_ms)
     out_tput = rate_req_s * float(ctx.scenario.osl) / float(topo.num_chips)
     tot_tput = (
         rate_req_s * float(ctx.scenario.isl + ctx.scenario.osl) / float(topo.num_chips)
     )
     slo_ok = (
-        ctx.scenario.ttft_slo_ms is None or p90_ttft_ms <= ctx.scenario.ttft_slo_ms
-    ) and (ctx.scenario.tpot_slo_ms is None or p90_tpot_ms <= ctx.scenario.tpot_slo_ms)
+        ctx.scenario.ttft_slo_ms is None or est_ttft_ms <= ctx.scenario.ttft_slo_ms
+    ) and (ctx.scenario.tpot_slo_ms is None or est_tpot_ms <= ctx.scenario.tpot_slo_ms)
     max_seqs_flag = b_res if b_res < b_local else ctx.scenario.max_num_seqs
     pool = PoolMeshPlan(
         role="mixed",
@@ -1881,9 +1865,9 @@ def _evaluate_mixed_point(
         total_chips=topo.num_chips,
         prefill_pool=None,
         decode_pool=pool,
-        p90_ttft_ms=p90_ttft_ms,
-        p90_tpot_ms=p90_tpot_ms,
-        p90_interactivity_tok_s=interactivity,
+        est_ttft_ms=est_ttft_ms,
+        est_tpot_ms=est_tpot_ms,
+        est_interactivity_tok_s=interactivity,
         output_throughput_per_chip=out_tput,
         token_throughput_per_chip=tot_tput,
         p_mixed=p_mix,
@@ -1892,6 +1876,7 @@ def _evaluate_mixed_point(
         decode_floor=_floor_times(sf_dec),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=h_eff,
+        bound_tpot_ms=(sf_dec.hard_floor_s * 1e3) / ctx.eff_al,
     )
 
 
@@ -1944,7 +1929,7 @@ def _evaluate_mixed_candidates(
                 )
                 min_c1_tpot_ms = min(
                     min_c1_tpot_ms,
-                    sf_c1.serial_floor_s * 1e3 / ctx.eff_al,
+                    sf_c1.serial_estimate_s * 1e3 / ctx.eff_al,
                 )
             if ctx.mode not in ("auto", "mixed"):
                 continue
@@ -1963,7 +1948,7 @@ def _evaluate_mixed_candidates(
                 ctx.dtypes,
                 topology=topo,
             )
-            min_req_ttft_ms = min(min_req_ttft_ms, sf_ttft.serial_floor_s * 1e3)
+            min_req_ttft_ms = min(min_req_ttft_ms, sf_ttft.serial_estimate_s * 1e3)
             b_kv_phys_core = hbm_footprint_per_core_bytes(
                 ctx.geom,
                 ctx.dtypes,
@@ -2050,15 +2035,15 @@ def _compute_disagg_metrics(
     c, x_p, y_d, total_chips = rates_in
     b_res, b_local, ttft_eff_ms, rate_p_eff, h_eff = batch_in
     dec_steps_per_req = max(1.0, ctx.scenario.osl / ctx.eff_al)
-    p90_tpot_ms = sf_d.serial_floor_s * 1e3 / ctx.eff_al
-    interactivity = 1000.0 / max(1e-6, p90_tpot_ms)
+    est_tpot_ms = sf_d.serial_estimate_s * 1e3 / ctx.eff_al
+    interactivity = 1000.0 / max(1e-6, est_tpot_ms)
     res_cap_d = float(b_res * max(1, y_d * dec.par.dp))
     c_served_d = min(float(c), res_cap_d)
-    rate_d_cap = c_served_d / (dec_steps_per_req * max(1e-9, sf_d.serial_floor_s))
+    rate_d_cap = c_served_d / (dec_steps_per_req * max(1e-9, sf_d.serial_estimate_s))
     c_demand_d = min(float(c), float(b_local * max(1, y_d * dec.par.dp)))
     queue_wait_d_ms = (
         max(0.0, (c_demand_d / max(1e-9, res_cap_d)) - 1.0)
-        * (dec_steps_per_req * sf_d.serial_floor_s)
+        * (dec_steps_per_req * sf_d.serial_estimate_s)
         * 1e3
     )
     uncached_d_tok = max(1, math.ceil((1.0 - h_eff) * ctx.scenario.isl))
@@ -2094,12 +2079,12 @@ def _compute_disagg_metrics(
         if offload_read_d_b > 0.0 and pcie_d_bw > 0.0 and math.isfinite(pcie_d_bw)
         else 0.0
     )
-    p90_ttft_d_ms = ttft_eff_ms + pcie_d_ms + kv_xfer_ms + queue_wait_d_ms
+    est_ttft_d_ms = ttft_eff_ms + pcie_d_ms + kv_xfer_ms + queue_wait_d_ms
     if ctx.scenario.think_time_s > 0.0:
         client_rate = float(c) / max(
             1e-9,
             ttft_eff_ms * 1e-3
-            + dec_steps_per_req * sf_d.serial_floor_s
+            + dec_steps_per_req * sf_d.serial_estimate_s
             + ctx.scenario.think_time_s,
         )
         coupled_rate = min(x_p * rate_p_eff, rate_d_cap, client_rate)
@@ -2109,7 +2094,7 @@ def _compute_disagg_metrics(
     tot_tput = (
         coupled_rate * float(ctx.scenario.isl + ctx.scenario.osl) / float(total_chips)
     )
-    return p90_ttft_d_ms, p90_tpot_ms, interactivity, out_tput, tot_tput
+    return est_ttft_d_ms, est_tpot_ms, interactivity, out_tput, tot_tput
 
 
 def _evaluate_disagg_instance_pair(
@@ -2151,7 +2136,7 @@ def _evaluate_disagg_instance_pair(
                     topology=dec.topo,
                 )
             )
-            w_srv = pref.ttft_ms * 1e-3 + dec_steps_per_req * sf_d_tmp.serial_floor_s
+            w_srv = pref.ttft_ms * 1e-3 + dec_steps_per_req * sf_d_tmp.serial_estimate_s
             c_act = float(c) * w_srv / (w_srv + ctx.scenario.think_time_s)
             b_local = max(1, math.ceil(c_act / max(1, y_d * dec.par.dp)))
     b_res = min(b_local, dec.b_hbm_max, dec.b_smem_max)
@@ -2224,11 +2209,11 @@ def _evaluate_disagg_instance_pair(
                 pref.topo,
             )
             ttft_p_eff = (
-                sf_p_eff.serial_floor_s
+                sf_p_eff.serial_estimate_s
                 * (1.0 + float(pref.par.pp - 1) / float(max(1, n_chunks_p)))
                 * 1e3
             )
-            rate_p_eff = 1.0 / max(1e-9, sf_p_eff.serial_floor_s)
+            rate_p_eff = 1.0 / max(1e-9, sf_p_eff.serial_estimate_s)
             cached_p = (ttft_p_eff, rate_p_eff)
             cache[p_key] = cached_p
         ttft_eff_ms, rate_p_eff = cached_p
@@ -2256,7 +2241,7 @@ def _evaluate_disagg_instance_pair(
             topology=dec.topo,
         )
     )
-    p90_ttft_d_ms, p90_tpot_ms, interactivity, out_tput, tot_tput = (
+    est_ttft_d_ms, est_tpot_ms, interactivity, out_tput, tot_tput = (
         _compute_disagg_metrics(
             ctx,
             dec,
@@ -2267,8 +2252,8 @@ def _evaluate_disagg_instance_pair(
         )
     )
     slo_ok = (
-        ctx.scenario.ttft_slo_ms is None or p90_ttft_d_ms <= ctx.scenario.ttft_slo_ms
-    ) and (ctx.scenario.tpot_slo_ms is None or p90_tpot_ms <= ctx.scenario.tpot_slo_ms)
+        ctx.scenario.ttft_slo_ms is None or est_ttft_d_ms <= ctx.scenario.ttft_slo_ms
+    ) and (ctx.scenario.tpot_slo_ms is None or est_tpot_ms <= ctx.scenario.tpot_slo_ms)
     max_seqs_d = b_res if b_res < b_local else ctx.scenario.max_num_seqs
     p_pool = PoolMeshPlan(
         role="prefill",
@@ -2327,9 +2312,9 @@ def _evaluate_disagg_instance_pair(
         total_chips=total_chips,
         prefill_pool=p_pool,
         decode_pool=d_pool,
-        p90_ttft_ms=p90_ttft_d_ms,
-        p90_tpot_ms=p90_tpot_ms,
-        p90_interactivity_tok_s=interactivity,
+        est_ttft_ms=est_ttft_d_ms,
+        est_tpot_ms=est_tpot_ms,
+        est_interactivity_tok_s=interactivity,
         output_throughput_per_chip=out_tput,
         token_throughput_per_chip=tot_tput,
         p_mixed=0.0,
@@ -2338,6 +2323,7 @@ def _evaluate_disagg_instance_pair(
         decode_floor=_floor_times(sf_d),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=h_eff,
+        bound_tpot_ms=(sf_d.hard_floor_s * 1e3) / ctx.eff_al,
     )
 
 
@@ -2372,7 +2358,7 @@ def _search_disagg_instance_ratios(
             topology=dec.topo,
         )
     )
-    rate_d_one = float(c) / (dec_steps_per_req * max(1e-9, sf_d_one.serial_floor_s))
+    rate_d_one = float(c) / (dec_steps_per_req * max(1e-9, sf_d_one.serial_estimate_s))
     eff_max_inst = ctx.max_instances if ctx.max_instances is not None else 16
     if ctx.max_chips is None:
         ratio_xp = math.ceil(rate_d_one / max(1e-9, pref.rate_p)) + 1
@@ -2839,7 +2825,7 @@ def _eval_disagg_sweep_cand(
     ctx_full = scen.isl + scen.osl
 
     eff_al = max(1.0, scen.accept_len)
-    sf_dec_s = pt.p90_tpot_ms * (eff_al * 1e-3)
+    sf_dec_s = pt.est_tpot_ms * (eff_al * 1e-3)
     dec_dur_s = max(1.0, scen.osl / eff_al) * sf_dec_s
     res_cap_d = float(b_res * d_idp)
     conc_f = float(pt.concurrency)
@@ -3160,8 +3146,8 @@ def _eval_grid_mix_candidates(
         )
         denom_pm = ctx.dec_steps + bn
         p_mix = min(1.0, bn / max(1.0, denom_pm))
-        p90_step_s = (1.0 - p_mix) * sf_dec_s + p_mix * mix_serial_s
-        tpot_h = p90_step_s * ctx.inv_al_ms
+        est_step_s = (1.0 - p_mix) * sf_dec_s + p_mix * mix_serial_s
+        tpot_h = est_step_s * ctx.inv_al_ms
         inter_h = 1000.0 / max(1e-06, tpot_h)
         tput = rate_s * inv_chips
         slo_ok = (ctx.ttft_slo is None or ttft_h <= ctx.ttft_slo) and (
@@ -3621,7 +3607,7 @@ class _CrossoverPlanner:
                 sf_obj = _scale_ep_moe_floor(sf_obj, self.chip, self.geom, par, eff_pre)
             if par.pp > 1:
                 sf_obj = _scale_pp_stage_floor(sf_obj, pp_part, self.chip, par, topo)
-            sf_s = sf_obj.serial_floor_s
+            sf_s = sf_obj.serial_estimate_s
             self.pre_step_cache[skey] = sf_s
         return sf_s
 
@@ -3682,8 +3668,10 @@ class _CrossoverPlanner:
                     sf_ver_only = _scale_ep_moe_floor(
                         sf_ver_only, self.chip, self.geom, par, tot_tok
                     )
-                draft_s = max(0.0, sf_dec.serial_floor_s - sf_ver_only.serial_floor_s)
-                val = (sf_dec.serial_floor_s, draft_s)
+                draft_s = max(
+                    0.0, sf_dec.serial_estimate_s - sf_ver_only.serial_estimate_s
+                )
+                val = (sf_dec.serial_estimate_s, draft_s)
             self.dec_cache[key] = val
         return val
 

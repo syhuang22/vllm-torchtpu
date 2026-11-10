@@ -18,6 +18,7 @@ from __future__ import annotations
 from .chips import CHIPS, TOPOLOGIES, ChipSpec, SliceTopology
 from .collectives import (
     Collective,
+    collective_cut_bound_s,
     collective_ici_hops,
     submesh_for_group,
     torus_collective_s,
@@ -111,6 +112,7 @@ __all__ = [
     "top_layouts",
     "write_html",
     "build_example_scenario",
+    "collective_cut_bound_s",
     "collective_ici_hops",
     "dtypes_from_hf_config",
     "ep_busiest_experts",

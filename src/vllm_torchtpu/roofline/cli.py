@@ -1031,8 +1031,8 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(f"WARNING: {w}\n")
         sys.stdout.write(
             f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pools':<24}  "
-            f"{'p90_int_tok_s':>13}  {'tok_tput_chip':>13}  {'p90_ttft_ms':>11}  "
-            f"{'p90_tpot_ms':>11}\n"
+            f"{'est_int_tok_s':>13}  {'tok_tput_chip':>13}  {'est_ttft_ms':>11}  "
+            f"{'est_tpot_ms':>11}\n"
         )
         for pt in splan.frontier:
             if pt.prefill_pool is not None:
@@ -1044,9 +1044,9 @@ def main(argv: list[str] | None = None) -> int:
                 pools = f"1x{pt.decode_pool.topology}(TP{pt.decode_pool.tp})"
             sys.stdout.write(
                 f"{pt.mode:<7}  {pt.concurrency:>5}  {pt.total_chips:>5}  "
-                f"{pools:<24}  {pt.p90_interactivity_tok_s:>13.2f}  "
+                f"{pools:<24}  {pt.est_interactivity_tok_s:>13.2f}  "
                 f"{pt.token_throughput_per_chip:>13.1f}  "
-                f"{pt.p90_ttft_ms:>11.1f}  {pt.p90_tpot_ms:>11.2f}\n"
+                f"{pt.est_ttft_ms:>11.1f}  {pt.est_tpot_ms:>11.2f}\n"
             )
         return 0
 
