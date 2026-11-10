@@ -67,21 +67,6 @@
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "unbound-name",
       "concise_description": "`payload` may be uninitialized"
     },

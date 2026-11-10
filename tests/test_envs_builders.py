@@ -221,6 +221,7 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
 @pytest.mark.parametrize(
     "name,expected",
     [
+        ("TPU_KV_RESHARD_TRANSPORT", "raiden"),
         ("TPU_KV_TRANSFER_PORT", "9100"),
         ("TPU_SIDE_CHANNEL_PORT", "9600"),
         ("TPU_NODE_ID", 0),
@@ -230,9 +231,6 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
         ("TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT", True),
         ("TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S", 30.0),
         ("TPU_RAIDEN_TEST_REGISTRATION_DELAY_S", 0.0),
-        ("TPU_KV_SHM_POOL_GB", 128.0),
-        ("TPU_USE_RAIDEN_CONNECTOR", False),
-        ("TPU_RAIDEN_TRANSFER_NUM_SLOTS", 0),
         ("TPU_RAIDEN_POOL_STAGING_LEASES", 8),
         ("TPU_RAIDEN_INLINE_LOAD", False),
         ("KDA_MANUAL_STATE_DMA", None),

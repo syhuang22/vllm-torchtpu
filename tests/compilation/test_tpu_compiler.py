@@ -339,7 +339,6 @@ class TestTpuCompilerCache:
         )
 
         serving_only = {
-            "TPU_KV_SHM_POOL_GB",
             "TPU_KV_TRANSFER_CHANNEL_NUMBER",
             "TPU_KV_TRANSFER_PORT",
             "TPU_NODE_ID",
@@ -350,10 +349,8 @@ class TestTpuCompilerCache:
             "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S",
             "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
             "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S",
-            "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
             "TPU_RAIDEN_TRANSFER_STREAMS",
             "TPU_SIDE_CHANNEL_PORT",
-            "TPU_USE_RAIDEN_CONNECTOR",
             "DEBUG_TPU_LOCAL_RANK_OFFSET",
             "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK",
             "RAIDEN_DISABLE_SINGLETON_WORKER",

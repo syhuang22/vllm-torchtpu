@@ -176,7 +176,6 @@ _TPU_COMPILE_ENV_IGNORED = {
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would
     # recompile the world whenever an operator retuned a port.
-    "TPU_KV_SHM_POOL_GB",
     "TPU_KV_TRANSFER_CHANNEL_NUMBER",
     "TPU_KV_TRANSFER_PORT",
     "TPU_NODE_ID",
@@ -187,11 +186,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S",
     "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
     "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S",
-    "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
     "TPU_SIDE_CHANNEL_PORT",
-    # The HBM reserve that feeds block-count sizing comes from
-    # kv_transfer_config, not from this variable.
-    "TPU_USE_RAIDEN_CONNECTOR",
     # Pipeline chunk sizing: scheduling and the extra token buckets, which
     # are keyed by shape inside the same cache.
     "TPU_PP_DYNAMIC_CHUNKS",

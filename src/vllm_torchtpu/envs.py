@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_KIMIK3_ADMISSION: bool = False
     TPU_RAIDEN_GLM_ADMISSION: bool = False
     TPU_RAIDEN_DSV4_ADMISSION: bool = False
-    TPU_KV_RESHARD_TRANSPORT: str = "zmq"
+    TPU_KV_RESHARD_TRANSPORT: str = "raiden"
     TPU_RAIDEN_CONTROLLER_ADDRESS: str = ""
     TPU_RAIDEN_JOB_NAME: str = ""
     TPU_RAIDEN_ENGINE_ID: str = "0"
@@ -157,9 +157,6 @@ if TYPE_CHECKING:
     TPU_RAIDEN_STAGE3_REGISTER_AHEAD: bool = True
     TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S: float = 30.0
     TPU_RAIDEN_TEST_REGISTRATION_DELAY_S: float = 0.0
-    TPU_KV_SHM_POOL_GB: float = 128.0
-    TPU_USE_RAIDEN_CONNECTOR: bool = False
-    TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
     TPU_RAIDEN_INLINE_LOAD: bool = False
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
@@ -628,12 +625,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # indexer, HCA, SWA and the compressor states. Every other model here has
     # exactly one.
     "TPU_RAIDEN_DSV4_ADMISSION": env_bool("TPU_RAIDEN_DSV4_ADMISSION"),
-    # Controller-driven Raiden Stage-3 pool resharding. ``raiden`` enables
-    # the fail-closed controller path; the ``zmq`` default only remains for
-    # the legacy (non-Stage-3) Raiden connector selected via
-    # TPU_USE_RAIDEN_CONNECTOR / use_raiden_connector.
+    # Transport backend for controller-driven KV cache resharding. "raiden" is
+    # the built-in default; kept as an extension parameter for custom transports.
     "TPU_KV_RESHARD_TRANSPORT": env_with_choices(
-        "TPU_KV_RESHARD_TRANSPORT", "zmq", ["zmq", "raiden"], case_sensitive=False
+        "TPU_KV_RESHARD_TRANSPORT", "raiden", ["raiden"], case_sensitive=False
     ),
     "TPU_RAIDEN_CONTROLLER_ADDRESS": lambda: os.getenv(
         "TPU_RAIDEN_CONTROLLER_ADDRESS", ""
@@ -1092,14 +1087,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TEST-ONLY fault injection, in seconds; 0 disables it.
     "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S": env_float(
         "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S", 0.0
-    ),
-    # Per-host GB budget for legacy (non-Stage-3) Raiden host staging slots.
-    "TPU_KV_SHM_POOL_GB": env_float("TPU_KV_SHM_POOL_GB", 128.0),
-    # kv_connector_extra_config.use_raiden_connector takes precedence.
-    "TPU_USE_RAIDEN_CONNECTOR": env_bool("TPU_USE_RAIDEN_CONNECTOR", default=False),
-    # 0 means auto-size from TPU_KV_SHM_POOL_GB, split across TP ranks.
-    "TPU_RAIDEN_TRANSFER_NUM_SLOTS": env_nonnegative_int(
-        "TPU_RAIDEN_TRANSFER_NUM_SLOTS", 0
     ),
     # Concurrent pool-reshard transfers to provision bounded host staging for.
     "TPU_RAIDEN_POOL_STAGING_LEASES": env_nonnegative_int(

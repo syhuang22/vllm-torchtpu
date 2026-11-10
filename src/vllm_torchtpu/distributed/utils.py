@@ -146,33 +146,6 @@ def get_stage3_test_registration_delay_s() -> float:
     return max(envs.TPU_RAIDEN_TEST_REGISTRATION_DELAY_S, 0.0)
 
 
-def get_kv_shm_pool_gb() -> float:
-    """Per-host GB budget for legacy (non-Stage-3) Raiden host staging slots.
-
-    The Raiden worker splits it across TP ranks and derives
-    ``num_slots = max(1, floor(per_rank_budget / per_slot_bytes))`` unless
-    ``TPU_RAIDEN_TRANSFER_NUM_SLOTS`` overrides it."""
-    return envs.TPU_KV_SHM_POOL_GB
-
-
-def get_use_raiden_connector() -> bool:
-    """Whether TPUConnector should use the opt-in Raiden backend.
-
-    The vLLM config flag ``kv_connector_extra_config.use_raiden_connector``
-    takes precedence when present. This environment variable is retained for
-    manual launch scripts and defaults to disabled.
-    """
-    return envs.TPU_USE_RAIDEN_CONNECTOR
-
-
-def get_raiden_transfer_num_slots() -> int:
-    """Override for Raiden-owned per-rank host staging slots.
-
-    0 means auto-size from TPU_KV_SHM_POOL_GB, split across TP ranks.
-    """
-    return envs.TPU_RAIDEN_TRANSFER_NUM_SLOTS
-
-
 def get_raiden_pool_staging_leases() -> int:
     """Concurrent pool-reshard transfers to provision bounded host staging for.
 

@@ -2,7 +2,7 @@
 
 Prefill/Decode (P/D) disaggregation separates compute-bound **Prefill** (`kv_producer`) and memory-bandwidth-bound **Decode** (`kv_consumer`) onto independent TPU engine pools. This prevents long-prompt prefills from stalling ongoing decode steps (eliminating TPOT spikes) and allows each pool to use the parallelism layout (`TP`, `DP`, `PCP`, `EP`) best suited to its phase.
 
-`vllm-torchtpu` transfers KV cache through the **Raiden KV Connector (`TpuRaidenConnector`)**: a high-bandwidth PJRT DMA/RDMA engine powered by `tpu-sync-torch` (`tpu_sync`) with a central coordinator (`run_raiden_controller.py`) and support for **heterogeneous P/D resharding** (e.g., Prefill with `PCP=4, TP=2` transferring KV cache into Decode with `DP=8, TP=1`). `TPUConnector` remains as a name for the same Raiden backend; it no longer has a ZMQ/shared-memory fallback and fails at startup unless Raiden is selected (`TPU_KV_RESHARD_TRANSPORT=raiden`).
+`vllm-torchtpu` transfers KV cache through the **Raiden KV Connector (`TpuRaidenConnector`)**: a high-bandwidth PJRT DMA/RDMA engine powered by `tpu-sync-torch` (`tpu_sync`) with a central coordinator (`run_raiden_controller.py`) and support for **heterogeneous P/D resharding** (e.g., Prefill with `PCP=4, TP=2` transferring KV cache into Decode with `DP=8, TP=1`). `TPUConnector` uses the same Raiden Stage-3 backend (`TPU_KV_RESHARD_TRANSPORT` defaults to `"raiden"` and fails fast at startup if overridden to an unsupported transport without subclassing).
 
 ---
 
@@ -153,4 +153,4 @@ Capacity-preemption abort follows `kv_load_failure_policy` by default (`"fail"` 
 | `TPU_RAIDEN_ENGINE_ID` | `"0"` | Unique engine replica ID within the job role. |
 | `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of concurrent DMA transfer streams per worker. |
 | `TPU_RAIDEN_RESHARD_IMPL` | `"controller"` | KV resharding implementation (`controller` or `host`) when Prefill and Decode shardings differ. |
-| `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | Set to `raiden` to enable the controller-planned Stage-3 reshard path (required for `TPUConnector`); `zmq` only keeps the legacy non-Stage-3 Raiden path. |
+| `TPU_KV_RESHARD_TRANSPORT` | `"raiden"` | Transport backend for the controller-planned Stage-3 reshard path (`"raiden"` is the built-in default; kept as an extension parameter for custom transports). |
