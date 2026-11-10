@@ -56,6 +56,10 @@ def register_tpu_platform() -> str:
     """vLLM out-of-tree platform plugin entry point."""
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
+    print("\n" + "=" * 80 + "\n" + "=" * 80 + "\n"
+          "!!!!!!!!!!  VLLM TORCHTPU PLATFORM SETUP: register_tpu_platform() CALLED  !!!!!!!!!!\n"
+          + "=" * 80 + "\n" + "=" * 80 + "\n",
+          flush=True)
     _log_tpu_info()
     return f"{TpuPlatform.__module__}.{TpuPlatform.__qualname__}"
 
