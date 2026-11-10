@@ -109,7 +109,8 @@ _EP8_REPLICA_PLAN = "replica_plan_ep8_real_plain4.npz"
 
 
 def _plan_or_default(value: str, default: str) -> str:
-    """A plan env value: empty takes ``default``, ``none`` disables it."""
+    """A plan env value: empty takes ``default``, ``none`` (the replica plan's
+    default) disables it."""
     if value.lower() == "none":
         return ""
     return value or default
@@ -149,6 +150,8 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
             replica_plan = _plan_or_default(
                 replica_plan, "" if envs.K3_HOT_PLAN else _EP8_REPLICA_PLAN
             )
+        else:
+            replica_plan = _plan_or_default(replica_plan, "")
         kernel_config.install(
             kernel_config.KernelConfig(
                 attention_dp=config.attention_dp,

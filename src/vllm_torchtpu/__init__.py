@@ -185,9 +185,10 @@ def _patch_vllm_megakernel_prefix_hits() -> None:
 
 
 def _patch_vllm_prefill_sjf_queue() -> None:
-    """``K3_PREFILL_SJF=1``: a KV producer's or aggregate engine's waiting queue
-    admits the request with the fewest uncached prompt tokens first, with aging
-    (``vllm_torchtpu.core.sjf_queue``). Other engines are unchanged."""
+    """A KV producer's or aggregate engine's waiting queue admits the request
+    with the fewest uncached prompt tokens first, with aging
+    (``vllm_torchtpu.core.sjf_queue``); ``K3_PREFILL_SJF=0`` keeps the upstream
+    queue. Other engines are unchanged."""
     from functools import wraps
 
     from vllm.v1.core.sched.scheduler import Scheduler

@@ -17,6 +17,11 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.megakernel.config import set_active_kernel_config
 
 
+def plan_name(value: str) -> str:
+    """A plan env value as a file name: ``none`` is no plan."""
+    return "" if value.lower() == "none" else value
+
+
 @dataclasses.dataclass(frozen=True)
 class KernelConfig:
     # Decode context parallel attention.
@@ -68,7 +73,7 @@ class KernelConfig:
     mla_flash_prefix_tiles: bool = True
     # Cached-prefix attention in FP8 (E4M3FN keys/values from the expansion, FP8
     # queries, probabilities x16 in E4M3FN, FP32 statistics); the window's own
-    # keys stay BF16. K3_PREFILL_PREFIX_FP8=1 turns it on.
+    # keys stay BF16. K3_PREFILL_PREFIX_FP8=0 turns it off.
     prefill_prefix_fp8: bool = dataclasses.field(
         default_factory=lambda: envs.K3_PREFILL_PREFIX_FP8
     )
@@ -114,9 +119,9 @@ class KernelConfig:
     # [92, 8 S] (the dispatch order of the slots). Per step, each replicated
     # expert's routes stay home, split by row parity, or move to the replica,
     # whichever gives the lowest modeled slowest-group expert time. A bare
-    # name loads from kimi_k3/data.
+    # name loads from kimi_k3/data. K3_REPLICA_PLAN=none (its default) is empty.
     kd_replica_plan: str = dataclasses.field(
-        default_factory=lambda: envs.K3_REPLICA_PLAN
+        default_factory=lambda: plan_name(envs.K3_REPLICA_PLAN)
     )
     # FP8 wires for attention DP's hidden-row gathers (off when empty): "t0"
     # the attention input, "t10" the MoE input. Rows travel as e4m3 with one
