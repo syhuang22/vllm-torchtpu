@@ -124,6 +124,10 @@ if TYPE_CHECKING:
     from ..advisor.workbench_engine import (
         render_workbench_engine_js,
     )
+    from ..advisor.workbench_phase import (
+        render_phase_extension_js,
+        render_phase_stage_tab_button,
+    )
 
 _SUBMODULES = frozenset(
     {
@@ -143,6 +147,7 @@ _SUBMODULES = frozenset(
         "vmem",
         "workbench",
         "workbench_engine",
+        "workbench_phase",
     }
 )
 
@@ -239,6 +244,9 @@ _LAZY = {
     "validate_advise_inputs": ".vmem",
     # workbench_engine
     "render_workbench_engine_js": ".workbench_engine",
+    # workbench_phase
+    "render_phase_extension_js": ".workbench_phase",
+    "render_phase_stage_tab_button": ".workbench_phase",
 }
 
 
@@ -331,6 +339,8 @@ __all__ = [
     "public_calibration_path",
     "recommend_parallelism",
     "render_advisor_html",
+    "render_phase_extension_js",
+    "render_phase_stage_tab_button",
     "render_regime_dot_plot_svg",
     "render_workbench_engine_js",
     "resolve_chip_spec",

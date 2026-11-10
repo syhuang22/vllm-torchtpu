@@ -34,9 +34,11 @@ from .regimes import (
     recommend_parallelism,
 )
 from .report import (
+    build_bucket_schedule,
     format_advisor_summary,
     format_regime_table,
     write_advisor_html,
+    write_bucket_schedule,
 )
 from .specs import (
     DispatchRegime,
@@ -303,6 +305,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="deployment_preset",
         help="Ignore deployment presets during regime sweep.",
     )
+    parser.add_argument(
+        "--bucket-schedule",
+        type=str,
+        default=None,
+        help=(
+            "Write advisory advisor.bucket_schedule.v1 JSON schedule to this path "
+            "(or '-' for stdout)"
+        ),
+    )
     return parser
 
 
@@ -404,6 +415,64 @@ def _run_calibrate_cli(argv: Sequence[str]) -> int:
     return 0
 
 
+def _resolve_cli_measurements(
+    args: argparse.Namespace,
+    chip_spec: ChipSpec,
+) -> str | None:
+    """Resolve --measurements path, validating bundled priors for chip_spec."""
+    measurements_val = args.measurements
+    if measurements_val in ("bundled", "auto"):
+        bundled_path = public_calibration_path(chip_spec.name)
+        if bundled_path is None:
+            msg = (
+                "No bundled architectural priors available for chip "
+                f"'{chip_spec.name}'. Specify a custom path to --measurements."
+            )
+            raise errors.MegakernelConfigError(msg)
+        return str(bundled_path)
+    return measurements_val
+
+
+def _run_sweep_mode(
+    args: argparse.Namespace,
+    profile: ModelProfile,
+    chip_spec: ChipSpec,
+    measurements_val: str | None,
+) -> int:
+    """Run regime sweep, HTML report, or bucket schedule emission."""
+    sweep = advise_regimes(
+        profile,
+        chip_spec,
+        tp=args.tp,
+        ep=args.ep,
+        dp=args.dp,
+        pp=args.pp,
+        dcp=args.dcp,
+        pcp=args.pcp,
+        vmem_alias=args.vmem_alias,
+        vmem_fit_headroom=args.vmem_fit_headroom,
+        op_overhead_us=args.op_overhead_us,
+        vmem_budget_mib=args.vmem_budget_mib,
+        dma_buffers=args.dma_buffers,
+        deployment_preset=args.deployment_preset,
+        measurements=measurements_val,
+        objective=args.objective,
+        dispatch_regime=args.dispatch_regime,
+    )
+    if args.html:
+        write_advisor_html(sweep, args.html)
+    if args.bucket_schedule is not None:
+        if args.bucket_schedule == "-":
+            _emit_json(build_bucket_schedule(sweep).to_dict(), "-")
+        else:
+            write_bucket_schedule(sweep, args.bucket_schedule)
+    if args.json is not None:
+        _emit_json(sweep.to_dict(), args.json)
+    elif args.regime_sweep:
+        sys.stdout.write(format_regime_table(sweep) + "\n")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the fusion-scope advisor command-line interface."""
     argv_list = list(sys.argv[1:] if argv is None else argv)
@@ -419,45 +488,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise errors.MegakernelConfigError(msg)
 
     profile, chip_spec = _resolve_cli_model_and_chip(args)
+    measurements_val = _resolve_cli_measurements(args, chip_spec)
 
-    measurements_val = args.measurements
-    if measurements_val in ("bundled", "auto"):
-        bundled_path = public_calibration_path(chip_spec.name)
-        if bundled_path is None:
-            msg = (
-                "No bundled architectural priors available for chip "
-                f"'{chip_spec.name}'. Specify a custom path to --measurements."
-            )
-            raise errors.MegakernelConfigError(msg)
-        measurements_val = str(bundled_path)
-
-    if args.regime_sweep or args.html:
-        sweep = advise_regimes(
-            profile,
-            chip_spec,
-            tp=args.tp,
-            ep=args.ep,
-            dp=args.dp,
-            pp=args.pp,
-            dcp=args.dcp,
-            pcp=args.pcp,
-            vmem_alias=args.vmem_alias,
-            vmem_fit_headroom=args.vmem_fit_headroom,
-            op_overhead_us=args.op_overhead_us,
-            vmem_budget_mib=args.vmem_budget_mib,
-            dma_buffers=args.dma_buffers,
-            deployment_preset=args.deployment_preset,
-            measurements=measurements_val,
-            objective=args.objective,
-            dispatch_regime=args.dispatch_regime,
-        )
-        if args.html:
-            write_advisor_html(sweep, args.html)
-        if args.json is not None:
-            _emit_json(sweep.to_dict(), args.json)
-        elif args.regime_sweep:
-            sys.stdout.write(format_regime_table(sweep) + "\n")
-        return 0
+    if args.regime_sweep or args.html or args.bucket_schedule:
+        return _run_sweep_mode(args, profile, chip_spec, measurements_val)
 
     tp, ep, dp, pp, dcp = _resolve_cli_mesh(args)
     if tp is None:
