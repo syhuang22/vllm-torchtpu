@@ -304,6 +304,7 @@ def _set_exec_state(
         num_reqs_list=num_reqs_list or [len(num_scheduled)],
         spec_decode_metadata_list=md_list or [None] * len(logits_list),
         mamba_state_indices_list=None,
+        mamba_boundary_plans=None,
         pooler_output_list=[],
         top_tokens=top_tokens,
         kv_save_nan_check=None,
@@ -809,7 +810,7 @@ class TestKMPKernelsFuzz:
             assert torch.equal(out_l[1], snap[1]) and eff_d[1].item() == 77
             assert (eff_d[2:] == 77).all()
 
-        # _AMAX_SENTINEL == INT32_MIN preserves even INT32_MIN in active scatter rows.
+        # scatter_ops.AMAX_SENTINEL == INT32_MIN preserves INT32_MIN in active rows.
         i32_min = torch.iinfo(torch.int32).min
         base = torch.zeros((4, 2), dtype=torch.int32)
         vals = torch.tensor([[i32_min, 7], [9, i32_min]], dtype=torch.int32)
@@ -838,7 +839,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         pool: RequestSlotTable[tuple[int, int]] = RequestSlotTable(
             max_num_reqs=2, num_cols=2, sentinel_row=(-99, 0)
         )
-        assert pool.capacity == 3 and pool.num_cols == 2 and pool.table is None
+        assert pool.max_num_reqs == 2 and pool.table is None
         tracked = {"a": (10, 1), "b": (20, 2), "c": (30, 3)}
         pool.mark_dirty("a", tracked["a"])
         assert not pool.needs_cold_reseed(["a"], tracked)
@@ -851,7 +852,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             return tracked[rid]
 
         tbl = pool.sync_step(torch.device("cpu"), ["a", "b"], tracked, cold_row)
-        assert tbl is not None and cold_calls == ["b"]
+        assert tbl is not None and tbl.shape == (3, 2) and cold_calls == ["b"]
         assert tuple(tbl[0].tolist()) == (-99, 0)
         sa, sb = pool.slot_for("a"), pool.slot_for("b")
         assert sa is not None and sb is not None and sa != sb
@@ -1612,7 +1613,7 @@ class TestSampleTokens:
                 [50, 51, 52, GEMMA4_END[0]],
                 [69],
             ]
-            st_tbl = runner._thinking_budget.ensure_state_table(torch.device("cpu"))
+            st_tbl = runner._thinking_budget.slots.ensure_table(torch.device("cpu"))
             slot_r2 = runner._thinking_budget.slots.slot_for("r2")
             assert slot_r2 is not None
             assert int(st_tbl[slot_r2, COL_THINK_COUNT].item()) == 1

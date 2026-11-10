@@ -106,14 +106,7 @@ class RequestSlotTable[RowT: Sequence[int]]:
     def max_num_reqs(self) -> int:
         return self._max_num_reqs
 
-    @property
-    def capacity(self) -> int:
-        return self._capacity
-
-    @property
-    def num_cols(self) -> int:
-        return self._num_cols
-
+    # Read-only slot/table introspection for unit tests and stateful adapters.
     @property
     def table(self) -> torch.Tensor | None:
         return self._table

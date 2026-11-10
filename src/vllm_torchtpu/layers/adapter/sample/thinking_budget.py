@@ -343,6 +343,7 @@ def advance_state(
     )
 
 
+# Scalar KMP query counterpart to advance_state for CPU reference checks.
 def query_forced_token(state: StateTuple, markers: ThinkingBudgetMarkers) -> int:
     """Return the forced token ID for ``state``, or ``NO_FORCED_TOKEN`` (-1)."""
     return _query_forced_token_cols(

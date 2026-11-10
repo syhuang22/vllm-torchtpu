@@ -127,9 +127,6 @@ class ThinkingBudgetTracker:
     def commit_state_table(self, state_table: torch.Tensor) -> None:
         self._slots.commit_table(state_table)
 
-    def ensure_state_table(self, device: torch.device) -> torch.Tensor:
-        return self._slots.ensure_table(device)
-
     def discard(self, req_ids: Iterable[str]) -> None:
         if not self._budgets:
             return
