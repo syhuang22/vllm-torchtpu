@@ -382,3 +382,54 @@ def test_cli_forwards_spec_tokens_and_token_caps(
     assert "--max-model-len" in launch_args
     assert "16384" in launch_args
     assert "--speculative-config" in launch_args
+
+
+def test_every_cli_flag_has_help(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify every CLI flag has help text with unit/scope, aliases, and assumptions."""
+    parser = cli.build_parser()
+    subparsers_actions = [
+        a for a in parser._actions if hasattr(a, "choices") and type(a.choices) is dict
+    ]
+    assert len(subparsers_actions) == 1
+    for sub_name, sub_parser in subparsers_actions[0].choices.items():
+        for action in sub_parser._actions:
+            if not action.option_strings or "-h" in action.option_strings:
+                continue
+            assert action.help is not None, (
+                f"{sub_name} {action.option_strings} missing help"
+            )
+            help_str = action.help.strip()
+            assert help_str and help_str != "==SUPPRESS==", (
+                f"{sub_name} {action.option_strings} empty help"
+            )
+            assert "scope:" in help_str.lower(), (
+                f"{sub_name} {action.option_strings} help missing scope: {help_str}"
+            )
+            assert "unit:" in help_str.lower(), (
+                f"{sub_name} {action.option_strings} help missing unit: {help_str}"
+            )
+
+    rc_assump = cli.main(["solve", "--assumptions", "--json"])
+    assert rc_assump == 0
+    assump_payload = json.loads(capsys.readouterr().out)
+    assert "catalog" in assump_payload
+    assert "dcn_bw" in assump_payload["catalog"]
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(QWEN35_CFG))
+    rc_alias = cli.main(
+        [
+            "explain",
+            "--config",
+            str(cfg_path),
+            "--tp",
+            "8",
+            "--ici-bw-gbytes-per-s",
+            "250",
+            "--json",
+        ]
+    )
+    assert rc_alias == 0
+    _ = capsys.readouterr()

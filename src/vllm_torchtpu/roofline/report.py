@@ -21,6 +21,8 @@ import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .chips import CHIPS, chip_catalog
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -624,6 +626,93 @@ def _render_table_rows(top_k: list[dict[str, Any]]) -> str:
     return "".join(rows)
 
 
+def _render_assumptions_card(payload: dict[str, Any]) -> list[str]:
+    """Render Assumptions, Hardware Specs & Scope card from chip catalog."""
+    chip_spec = payload.get("chip_spec")
+    if type(chip_spec) is not dict:
+        base_chip = CHIPS["tpu7x"]
+        chip_spec = {
+            "name": base_chip.name,
+            "hbm_bytes": base_chip.hbm_bytes,
+            "hbm_bw": base_chip.hbm_bw,
+            "bf16_flops": base_chip.bf16_flops,
+            "fp8_flops": base_chip.fp8_flops,
+            "mxu_m_tile": base_chip.mxu_m_tile,
+            "ici_link_bw": base_chip.ici_link_bw,
+            "ici_bw": base_chip.ici_bw,
+            "d2d_bw": base_chip.d2d_bw,
+            "ici_hop_latency_s": base_chip.ici_hop_latency_s,
+            "dcn_bw": base_chip.dcn_bw,
+            "pcie_bw": base_chip.pcie_bw,
+            "catalog": chip_catalog(base_chip),
+        }
+    cat = chip_spec.get("catalog")
+    if type(cat) is not dict:
+        cat = chip_catalog(CHIPS["tpu7x"])
+    gmu = float(payload.get("gpu_memory_utilization") or 0.92)
+    hbm_gb = float(chip_spec.get("hbm_bytes", 103_000_000_000)) / 1e9
+    usable_gb = hbm_gb * gmu
+    hbm_bw_tb = float(chip_spec.get("hbm_bw", 3.70e12)) / 1e12
+    bf16_pf = float(chip_spec.get("bf16_flops", 1.155e15)) / 1e15
+    fp8_pf = float(chip_spec.get("fp8_flops", 2.30e15)) / 1e15
+    m_tile = int(chip_spec.get("mxu_m_tile", 256))
+    link_gb = float(chip_spec.get("ici_link_bw", 100.0e9)) / 1e9
+    core_ici_gb = float(chip_spec.get("ici_bw", 300.0e9)) / 1e9
+    d2d_gb = float(chip_spec.get("d2d_bw", 600.0e9)) / 1e9
+    hop_us = float(chip_spec.get("ici_hop_latency_s", 1.0e-6)) * 1e6
+    dcn_gb = float(chip_spec.get("dcn_bw", 12.5e9)) / 1e9
+    pcie_gb = float(chip_spec.get("pcie_bw", 64.0e9)) / 1e9
+    cat_items: list[str] = []
+    for k, entry in cat.items():
+        if type(entry) is not dict:
+            continue
+        kind = _escape(entry.get("kind", ""))
+        scope = _escape(entry.get("scope", ""))
+        unit = _escape(entry.get("unit", ""))
+        val = _escape(entry.get("value", ""))
+        src = _escape(entry.get("source", ""))
+        cat_items.append(
+            f"<li><code>{_escape(k)}</code> = <code>{val} {unit}</code> "
+            f"[{kind}, scope={scope}]: {src}</li>"
+        )
+    return [
+        '  <section class="card assumptions-card">',
+        "    <h2>Assumptions, Hardware Specs &amp; Scope</h2>",
+        "    <ul>",
+        "      <li><strong>Datasheet Bounds:</strong> <code>Hard Floor</code> is "
+        "<code>max(HBM, Matmul, ICI)</code> "
+        "(full communication-compute overlap); "
+        "<code>Serial Estimate</code> sums per-module "
+        "<code>max(HBM, Matmul)</code> plus exposed <code>ICI Chain</code> "
+        "(zero overlap) for layout ranking.</li>",
+        "      <li><strong>Public TPU v7x Per-TensorCore &amp; Chip Specs:</strong> "
+        f"<code>{hbm_gb:.1f} GB</code> HBM "
+        f"(<code>{usable_gb:.2f} GB</code> at <code>{gmu:.2f}</code> utilization), "
+        f"<code>{hbm_bw_tb:.2f} TB/s</code> HBM, "
+        f"<code>{bf16_pf:.3f} PFLOP/s</code> BF16, "
+        f"<code>{fp8_pf:.3f} PFLOP/s</code> FP8, "
+        f"<code>{m_tile}</code>-row MXU contraction tile, "
+        f"<code>{link_gb:.0f} GB/s</code>/link "
+        f"(<code>{core_ici_gb:.0f} GB/s</code>/core, "
+        f"<code>{d2d_gb:.0f} GB/s</code>/chip D2D) ICI + "
+        f"<code>{hop_us:.1f} us</code> hop, "
+        f"<code>{dcn_gb:.2f} GB/s</code>/chip DCN, and "
+        f"<code>{pcie_gb:.1f} GB/s</code>/chip PCIe.</li>",
+        "      <li><strong>Intentionally Omitted (Day-1 Trace Scope):</strong> "
+        "Empirical kernel utilization derates, XLA temporary workspace "
+        "(<code>8 ~ 15 GB/core</code>), "
+        "and trace-level LRU cache eviction or arrival burstiness.</li>",
+        "    </ul>",
+        "    <details><summary>Constants Catalog "
+        "(fact / derived / assumed / config)</summary>",
+        "    <ul>",
+        *[f"      {item}" for item in cat_items],
+        "    </ul>",
+        "    </details>",
+        "  </section>",
+    ]
+
+
 def render_html(payload: dict[str, Any]) -> str:
     """Render a fully self-contained, offline HTML report from a solve/v1 payload."""
     rec = payload.get("recommended")
@@ -820,28 +909,7 @@ def render_html(payload: dict[str, Any]) -> str:
         "      </tbody>",
         "    </table>",
         "  </section>",
-        '  <section class="card assumptions-card">',
-        "    <h2>Assumptions, Hardware Specs &amp; Scope</h2>",
-        "    <ul>",
-        "      <li><strong>Datasheet Bounds:</strong> <code>Hard Floor</code> is "
-        "<code>max(HBM, Matmul, ICI Chain)</code> "
-        "(full communication-compute overlap); "
-        "<code>Serial Floor</code> sums per-module <code>max(HBM, Matmul)</code> plus "
-        "exposed <code>ICI Chain</code> (zero overlap) for layout ranking.</li>",
-        "      <li><strong>Public TPU v7x Per-TensorCore Specs:</strong> "
-        "<code>103.0 GB</code> HBM "
-        "(<code>94.76 GB</code> at <code>0.92</code> utilization), "
-        "<code>3.70 TB/s</code> HBM, <code>1.155 PFLOP/s</code> BF16, "
-        "<code>2.300 PFLOP/s</code> FP8, <code>256</code>-row MXU contraction tile, "
-        "<code>100 GB/s</code>/link (<code>300 GB/s</code>/core) ICI + "
-        "<code>1.0 us</code> hop, "
-        "<code>12.5 GB/s</code>/chip DCN, and <code>64.0 GB/s</code>/chip PCIe.</li>",
-        "      <li><strong>Intentionally Omitted (Day-1 Trace Scope):</strong> "
-        "Empirical kernel utilization derates, XLA temporary workspace "
-        "(<code>8 ~ 15 GB/core</code>), "
-        "and trace-level LRU cache eviction or arrival burstiness.</li>",
-        "    </ul>",
-        "  </section>",
+        *_render_assumptions_card(payload),
         "  <footer>",
         "    Analytical roofline report generated by "
         "<code>vllm_torchtpu.roofline</code> &bull; "

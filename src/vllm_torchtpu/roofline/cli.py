@@ -23,7 +23,7 @@ import sys
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from .chips import CHIPS
+from .chips import CHIPS, JAX_VERSION, ChipSpec, chip_catalog
 from .emit import build_solve_payload, emit_ceiling_rows, emit_launch_args
 from .geometry import from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
@@ -54,11 +54,22 @@ _KV_BYTES: dict[str, float] = {"bf16": 2.0, "fp8": 1.0}
 _STATE_BYTES: dict[str, float] = {"fp32": 4.0, "bf16": 2.0}
 
 
-def _add_model_source(p: argparse.ArgumentParser, *, required: bool = True) -> None:
+def _add_model_source(p: argparse.ArgumentParser, *, required: bool = False) -> None:
     """Add mutually exclusive --config or --model flags to parser."""
     grp = p.add_mutually_exclusive_group(required=required)
-    grp.add_argument("--config", help="Path to HF config.json")
-    grp.add_argument("--model", help="HF model ID, directory, or config.json")
+    grp.add_argument(
+        "--config",
+        help=(
+            "Path to local Hugging Face config.json file (unit: path, scope: model)."
+        ),
+    )
+    grp.add_argument(
+        "--model",
+        help=(
+            "Hugging Face model ID, local directory, or config.json path "
+            "(unit: id_or_path, scope: model)."
+        ),
+    )
 
 
 def _normalize_tokens(raw_cmd: str) -> list[str]:
@@ -192,81 +203,411 @@ def _parse_bench_cmd(raw_cmd: str) -> dict[str, object]:
     return parsed
 
 
-def _add_common_args(p: argparse.ArgumentParser, *, tp_required: bool = True) -> None:
+def _add_common_args(p: argparse.ArgumentParser, *, tp_required: bool = False) -> None:
     """Add common serving and parallel execution flags to parser."""
-    _add_model_source(p)
-    p.add_argument("--chip", default="tpu7x", choices=sorted(CHIPS))
-    p.add_argument("--tp", type=int, required=tp_required, default=None)
-    p.add_argument("--context", type=int, default=0)
-    p.add_argument("--kv-split", type=int, default=1)
-    p.add_argument("--kv-merge", default="ag_rs", choices=("ag_rs", "exchange"))
-    p.add_argument("--moe", default="tp_slice", choices=("tp_slice", "ep"))
+    _add_model_source(p, required=False)
+    p.add_argument(
+        "--chip",
+        default="tpu7x",
+        choices=sorted(CHIPS),
+        help="Target TPU chip specification key (unit: enum, scope: chip).",
+    )
+    p.add_argument(
+        "--tp",
+        type=int,
+        required=tp_required,
+        default=None,
+        help=(
+            "Tensor parallel rank count across TensorCores (unit: ranks, scope: pool)."
+        ),
+    )
+    p.add_argument(
+        "--context",
+        type=int,
+        default=0,
+        help=(
+            "Active KV context length per sequence in tokens "
+            "(unit: tokens, scope: request)."
+        ),
+    )
+    p.add_argument(
+        "--kv-split",
+        type=int,
+        default=1,
+        help=(
+            "Decode context parallel KV split factor across ranks "
+            "(unit: ranks, scope: pool)."
+        ),
+    )
+    p.add_argument(
+        "--kv-merge",
+        default="ag_rs",
+        choices=("ag_rs", "exchange"),
+        help=(
+            "Context parallel attention merge collective schedule "
+            "(unit: enum, scope: pool)."
+        ),
+    )
+    p.add_argument(
+        "--moe",
+        default="tp_slice",
+        choices=("tp_slice", "ep"),
+        help=(
+            "Routed MoE weight sharding mode across ranks (unit: enum, scope: pool)."
+        ),
+    )
     p.add_argument(
         "--moe-dispatch",
         default="allreduce",
         choices=("allreduce", "a2a_push", "ag_ep", "fused_rs"),
+        help=(
+            "MoE token dispatch and combine collective schedule "
+            "(unit: enum, scope: pool)."
+        ),
     )
-    p.add_argument("--residual", default="replicated", choices=("replicated", "sp"))
+    p.add_argument(
+        "--residual",
+        default="replicated",
+        choices=("replicated", "sp"),
+        help=(
+            "Residual stream layout across tensor parallel ranks "
+            "(unit: enum, scope: pool)."
+        ),
+    )
     p.add_argument(
         "--ar-algo",
         default="one_shot",
         choices=("one_shot", "two_shot", "ring"),
+        help=(
+            "All-reduce collective algorithm on ICI links (unit: enum, scope: link)."
+        ),
     )
-    p.add_argument("--weight-dtype", default="fp8", choices=("bf16", "fp8"))
+    p.add_argument(
+        "--weight-dtype",
+        default="fp8",
+        choices=("bf16", "fp8"),
+        help=(
+            "Dense linear projection weight storage dtype (unit: dtype, scope: core)."
+        ),
+    )
     p.add_argument(
         "--expert-dtype",
         default="fp8",
         choices=("bf16", "fp8", "nvfp4", "mxfp4"),
+        help=("Routed MoE expert weight storage dtype (unit: dtype, scope: core)."),
     )
-    p.add_argument("--aux-dtype", default="bf16", choices=("bf16", "fp8"))
-    p.add_argument("--kv-dtype", default="fp8", choices=("bf16", "fp8"))
-    p.add_argument("--state-dtype", default="fp32", choices=("fp32", "bf16"))
-    p.add_argument("--act", default="a8", choices=("a8", "a16"))
-    p.add_argument("--ici-bw-gbps", type=float, default=None)
-    p.add_argument("--collective-latency-us", type=float, default=None)
-    p.add_argument("--json", action="store_true")
+    p.add_argument(
+        "--aux-dtype",
+        default="bf16",
+        choices=("bf16", "fp8"),
+        help=(
+            "Router, embedding, and LM-head weight dtype (unit: dtype, scope: core)."
+        ),
+    )
+    p.add_argument(
+        "--kv-dtype",
+        default="fp8",
+        choices=("bf16", "fp8"),
+        help="Paged KV cache storage dtype in HBM (unit: dtype, scope: core).",
+    )
+    p.add_argument(
+        "--state-dtype",
+        default="fp32",
+        choices=("fp32", "bf16"),
+        help=(
+            "Recurrent linear-attention state storage dtype (unit: dtype, scope: core)."
+        ),
+    )
+    p.add_argument(
+        "--act",
+        default="a8",
+        choices=("a8", "a16"),
+        help=(
+            "Matmul activation accumulation mode a8=FP8 or a16=BF16 "
+            "(unit: enum, scope: core)."
+        ),
+    )
+    p.add_argument(
+        "--ici-bw-gbps",
+        "--ici-bw-gbytes-per-s",
+        dest="ici_bw_gbps",
+        type=float,
+        default=None,
+        help=(
+            "Override per-core ICI egress bandwidth in gigabytes per second "
+            "(unit: GB/s, scope: core)."
+        ),
+    )
+    p.add_argument(
+        "--collective-latency-us",
+        type=float,
+        default=None,
+        help=(
+            "Override flat per-collective startup latency in microseconds "
+            "(unit: us, scope: link)."
+        ),
+    )
+    p.add_argument(
+        "--assumptions",
+        action="store_true",
+        help=(
+            "Print the hardware and solver constants catalog and exit "
+            "(unit: flag, scope: chip)."
+        ),
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit machine-readable JSON output to stdout (unit: flag, scope: command)."
+        ),
+    )
 
 
 def _add_scenario_args(p: argparse.ArgumentParser) -> None:
     """Add traffic scenario, SLO, and instance constraint flags."""
     _add_model_source(p, required=False)
-    p.add_argument("--chip", default="tpu7x", choices=sorted(CHIPS))
     p.add_argument(
-        "--example-scenario", default=None, choices=sorted(EXAMPLE_SCENARIOS)
+        "--chip",
+        default="tpu7x",
+        choices=sorted(CHIPS),
+        help="Target TPU chip specification key (unit: enum, scope: chip).",
     )
-    p.add_argument("--mode", default="auto", choices=("auto", "mixed", "disagg"))
-    p.add_argument("--max-chips", type=int, default=None)
-    p.add_argument("--max-instances", type=int, default=None)
     p.add_argument(
-        "--example-slo-tier", default="none", choices=sorted(EXAMPLE_SLO_TIERS)
+        "--example-scenario",
+        default=None,
+        choices=sorted(EXAMPLE_SCENARIOS),
+        help=("Predefined traffic scenario preset name (unit: enum, scope: workload)."),
     )
-    p.add_argument("--ttft-slo-ms", type=float, default=None)
-    p.add_argument("--tpot-slo-ms", type=float, default=None)
-    p.add_argument("--isl", type=int, default=None)
-    p.add_argument("--osl", type=int, default=None)
-    p.add_argument("--concurrency", default=None)
-    p.add_argument("--prefix-hit-rate", type=float, default=None)
-    p.add_argument("--shared-prefix-len", type=int, default=None)
-    p.add_argument("--random-prefix-len", type=int, default=None)
-    p.add_argument("--dcn-gbps", type=float, default=None)
-    p.add_argument("--kv-offload-gb", type=float, default=None)
-    p.add_argument("--from-serve-cmd", type=str, default=None)
-    p.add_argument("--from-bench-cmd", type=str, default=None)
-    p.add_argument("--accept-len", type=float, default=None)
-    p.add_argument("--think-time-s", type=float, default=None)
+    p.add_argument(
+        "--mode",
+        default="auto",
+        choices=("auto", "mixed", "disagg"),
+        help=(
+            "Pool serving architecture mode: mixed, disagg, or auto "
+            "(unit: enum, scope: cluster)."
+        ),
+    )
+    p.add_argument(
+        "--max-chips",
+        type=int,
+        default=None,
+        help=(
+            "Maximum physical TPU chips available across all pools "
+            "(unit: chips, scope: cluster)."
+        ),
+    )
+    p.add_argument(
+        "--max-instances",
+        type=int,
+        default=None,
+        help=(
+            "Maximum total serving instances across prefill and decode pools "
+            "(unit: instances, scope: cluster)."
+        ),
+    )
+    p.add_argument(
+        "--example-slo-tier",
+        default="none",
+        choices=sorted(EXAMPLE_SLO_TIERS),
+        help=("Named TTFT/TPOT latency SLO preset tier (unit: enum, scope: workload)."),
+    )
+    p.add_argument(
+        "--ttft-slo-ms",
+        type=float,
+        default=None,
+        help=(
+            "Target maximum Time To First Token SLO in milliseconds "
+            "(unit: ms, scope: request)."
+        ),
+    )
+    p.add_argument(
+        "--tpot-slo-ms",
+        type=float,
+        default=None,
+        help=(
+            "Target maximum Time Per Output Token SLO in milliseconds "
+            "(unit: ms, scope: request)."
+        ),
+    )
+    p.add_argument(
+        "--isl",
+        type=int,
+        default=None,
+        help=(
+            "Input sequence length per request in tokens "
+            "(unit: tokens, scope: request)."
+        ),
+    )
+    p.add_argument(
+        "--osl",
+        type=int,
+        default=None,
+        help=(
+            "Output sequence length per request in tokens "
+            "(unit: tokens, scope: request)."
+        ),
+    )
+    p.add_argument(
+        "--concurrency",
+        default=None,
+        help=(
+            "Comma-separated list of concurrent request counts to evaluate "
+            "(unit: requests, scope: workload)."
+        ),
+    )
+    p.add_argument(
+        "--prefix-hit-rate",
+        type=float,
+        default=None,
+        help=(
+            "Cached prefix token hit ratio in [0.0, 1.0] (unit: ratio, scope: request)."
+        ),
+    )
+    p.add_argument(
+        "--shared-prefix-len",
+        type=int,
+        default=None,
+        help=("Shared cached prefix length in tokens (unit: tokens, scope: request)."),
+    )
+    p.add_argument(
+        "--random-prefix-len",
+        type=int,
+        default=None,
+        help=(
+            "Benchmark random cached prefix length in tokens "
+            "(unit: tokens, scope: request)."
+        ),
+    )
+    p.add_argument(
+        "--dcn-gbps",
+        type=float,
+        default=None,
+        help=(
+            "Override per-chip DCN bandwidth in gigabits per second "
+            "(unit: Gbit/s, scope: chip)."
+        ),
+    )
+    p.add_argument(
+        "--kv-offload-gb",
+        type=float,
+        default=None,
+        help=(
+            "Host DRAM KV cache offloading capacity per instance in GiB "
+            "(unit: GiB, scope: host)."
+        ),
+    )
+    p.add_argument(
+        "--from-serve-cmd",
+        type=str,
+        default=None,
+        help=(
+            "Extract model and parallelism defaults from a vllm serve "
+            "command string (unit: cmd_str, scope: command)."
+        ),
+    )
+    p.add_argument(
+        "--from-bench-cmd",
+        type=str,
+        default=None,
+        help=(
+            "Extract traffic scenario defaults from a vllm bench serve "
+            "command string (unit: cmd_str, scope: command)."
+        ),
+    )
+    p.add_argument(
+        "--accept-len",
+        type=float,
+        default=None,
+        help=(
+            "Mean accepted tokens per speculative verification step >= 1.0 "
+            "(unit: tokens/step, scope: request)."
+        ),
+    )
+    p.add_argument(
+        "--think-time-s",
+        type=float,
+        default=None,
+        help=("Client think time between turns in seconds (unit: s, scope: request)."),
+    )
     p.add_argument(
         "--gpu-memory-utilization",
         type=float,
         default=None,
+        help=(
+            "Fraction of per-core HBM capacity usable for weights, state, "
+            "and KV cache (unit: ratio, scope: core)."
+        ),
     )
-    p.add_argument("--json", action="store_true")
+    p.add_argument(
+        "--assumptions",
+        action="store_true",
+        help=(
+            "Print the hardware and solver constants catalog and exit "
+            "(unit: flag, scope: chip)."
+        ),
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit machine-readable JSON output to stdout (unit: flag, scope: command)."
+        ),
+    )
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Run the roofline CLI subcommand."""
-    raw_argv = list(sys.argv[1:] if argv is None else argv)
+def _render_assumptions_view(chip: ChipSpec, *, as_json: bool) -> int:
+    """Write constants catalog for chip to stdout in text or JSON format."""
+    cat = chip_catalog(chip)
+    if as_json:
+        payload = {
+            "chip": chip.name,
+            "jax_version": JAX_VERSION,
+            "catalog": cat,
+        }
+        sys.stdout.write(json.dumps(payload) + "\n")
+        return 0
+    sys.stdout.write(
+        f"Constants catalog for chip={chip.name} (jax_version={JAX_VERSION}):\n"
+    )
+    sys.stdout.write(
+        f"{'name':<32}  {'value':>14}  {'unit':<8}  {'scope':<6}  {'kind':<8}  source\n"
+    )
+    for name, entry in cat.items():
+        val = entry["value"]
+        val_str = f"{val:.4g}" if type(val) is float else str(val)
+        sys.stdout.write(
+            f"{name:<32}  {val_str:>14}  {entry['unit']:<8}  "
+            f"{entry['scope']:<6}  {entry['kind']:<8}  {entry['source']}\n"
+        )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct and return the roofline CLI ArgumentParser."""
     parser = argparse.ArgumentParser(prog="python -m vllm_torchtpu.roofline")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    parser.add_argument(
+        "--chip",
+        default="tpu7x",
+        choices=sorted(CHIPS),
+        help="Target TPU chip specification key (unit: enum, scope: chip).",
+    )
+    parser.add_argument(
+        "--assumptions",
+        action="store_true",
+        help=(
+            "Print the hardware and solver constants catalog and exit "
+            "(unit: flag, scope: chip)."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit machine-readable JSON output to stdout (unit: flag, scope: command)."
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=False)
 
     p_solve = sub.add_parser("solve")
     _add_scenario_args(p_solve)
@@ -274,7 +615,10 @@ def main(argv: list[str] | None = None) -> int:
         "--html",
         type=Path,
         default=None,
-        help="Write an offline HTML report to PATH.",
+        help=(
+            "Write a self-contained offline HTML report to file path "
+            "(unit: path, scope: command)."
+        ),
     )
 
     p_emit = sub.add_parser("emit")
@@ -285,17 +629,78 @@ def main(argv: list[str] | None = None) -> int:
 
     p_plan = sub.add_parser("plan")
     _add_common_args(p_plan)
-    p_plan.add_argument("--concurrency", default="1,4,16,64")
-    p_plan.add_argument("--spec-window", type=int, default=0)
-    p_plan.add_argument("--acceptance-length", type=float, default=None)
+    p_plan.add_argument(
+        "--concurrency",
+        default="1,4,16,64",
+        help=(
+            "Comma-separated decode batch concurrencies to evaluate "
+            "(unit: requests, scope: pool)."
+        ),
+    )
+    p_plan.add_argument(
+        "--spec-window",
+        type=int,
+        default=0,
+        help=(
+            "Speculative draft token window k per verification step "
+            "(unit: tokens, scope: step)."
+        ),
+    )
+    p_plan.add_argument(
+        "--acceptance-length",
+        type=float,
+        default=None,
+        help=(
+            "Mean accepted tokens per verification step when spec-window > 0 "
+            "(unit: tokens/step, scope: step)."
+        ),
+    )
 
     p_exp = sub.add_parser("explain")
     _add_common_args(p_exp)
-    p_exp.add_argument("--batch", type=int, default=1)
-    p_exp.add_argument("--rows-per-seq", type=int, default=1)
-    p_exp.add_argument("--spec-window", type=int, default=0)
+    p_exp.add_argument(
+        "--batch",
+        type=int,
+        default=1,
+        help="Active sequence batch size per step (unit: requests, scope: step).",
+    )
+    p_exp.add_argument(
+        "--rows-per-seq",
+        type=int,
+        default=1,
+        help=(
+            "Token rows processed per sequence in the step "
+            "(unit: tokens/seq, scope: step)."
+        ),
+    )
+    p_exp.add_argument(
+        "--spec-window",
+        type=int,
+        default=0,
+        help=(
+            "Speculative draft token window k per verification step "
+            "(unit: tokens, scope: step)."
+        ),
+    )
+    return parser
 
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the roofline CLI subcommand."""
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
     args = parser.parse_args(raw_argv)
+    if args.assumptions:
+        chip_assump = CHIPS[args.chip]
+        if vars(args).get("dcn_gbps") is not None:
+            chip_assump = replace(chip_assump, dcn_bw=args.dcn_gbps * 1e9 / 8.0)
+        if vars(args).get("ici_bw_gbps") is not None:
+            chip_assump = replace(chip_assump, ici_bw=args.ici_bw_gbps * 1e9)
+        return _render_assumptions_view(chip_assump, as_json=bool(args.json))
+    if not args.cmd:
+        parser.error("the following arguments are required: cmd")
+    if args.cmd in ("plan", "explain") and args.tp is None:
+        parser.error("the following arguments are required: --tp")
     serve_parsed = (
         _parse_serve_cmd(args.from_serve_cmd)
         if args.cmd in ("solve", "emit", "ceiling") and args.from_serve_cmd

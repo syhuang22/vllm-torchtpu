@@ -190,3 +190,33 @@ def test_render_html_clean_svg_and_assumptions_card(
     assert "</text>'" not in html
     assert "94.76" in html
     assert "Assumptions, Hardware Specs" in html
+
+
+def test_report_card_renders_from_catalog(
+    sample_payload: dict[str, Any],
+) -> None:
+    """Verify report card and solve payload render from the chip catalog."""
+    chip_spec = sample_payload["chip_spec"]
+    assert "jax_version" in chip_spec
+    assert type(chip_spec["jax_version"]) is str and bool(chip_spec["jax_version"])
+    assert "catalog" in chip_spec
+    cat = chip_spec["catalog"]
+    assert "dcn_bw" in cat
+    assert cat["dcn_bw"]["kind"] == "derived"
+    assert "source" in cat["dcn_bw"]
+
+    html = render_html(sample_payload)
+    assert "12.50 GB/s" in html or "12.5 GB/s" in html
+    assert "fact" in html.lower()
+    assert "derived" in html.lower()
+    assert "assumed" in html.lower()
+
+    # Mutating catalog / chip_spec values updates HTML card dynamically
+    custom_payload = json.loads(json.dumps(sample_payload))
+    custom_payload["chip_spec"]["dcn_bw"] = 18.75e9
+    custom_payload["chip_spec"]["pcie_bw"] = 32.0e9
+    custom_payload["chip_spec"]["catalog"]["dcn_bw"]["value"] = 18.75e9
+    custom_payload["chip_spec"]["catalog"]["pcie_bw"]["value"] = 32.0e9
+    custom_html = render_html(custom_payload)
+    assert "18.75 GB/s" in custom_html or "18.8 GB/s" in custom_html
+    assert "32.0 GB/s" in custom_html

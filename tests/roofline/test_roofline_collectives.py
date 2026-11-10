@@ -51,7 +51,7 @@ def test_spec_cited_chip_and_unloaded_hop_latency() -> None:
     assert "contraction_floor_s" not in dir(chip)
     assert "d2d_latency_s" not in dir(chip)
     assert "usable_hbm_frac" not in dir(chip)
-    assert "d2d_bw" not in dir(chip)
+    assert chip.d2d_bw == pytest.approx(_EXPECTED_ICI_BW * chip.cores_per_chip)
     assert chip.ici_link_bw == _EXPECTED_LINK_BW
     assert chip.ici_bw == _EXPECTED_ICI_BW
     assert chip.ici_hop_latency_s == _EXPECTED_HOP_LATENCY

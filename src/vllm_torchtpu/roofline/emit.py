@@ -19,6 +19,8 @@ import shlex
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
+from .chips import JAX_VERSION, chip_catalog
+
 if TYPE_CHECKING:
     from .chips import ChipSpec
     from .modules import Dtypes
@@ -278,7 +280,10 @@ def build_solve_payload(
         "calibrated": False,
         "basis": "analytical roofline floors; p90 values are modeled, not measured",
     }
-    payload["chip_spec"] = asdict(chip)
+    chip_dict = asdict(chip)
+    chip_dict["jax_version"] = JAX_VERSION
+    chip_dict["catalog"] = chip_catalog(chip)
+    payload["chip_spec"] = chip_dict
     payload["model"] = model
     top_pts = top_layouts(plan, top_k)
     top1_tput = top_pts[0].token_throughput_per_chip if top_pts else 0.0

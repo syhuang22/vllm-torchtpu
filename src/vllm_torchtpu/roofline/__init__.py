@@ -75,6 +75,8 @@ from .step import StepFloor, spec_cycle_floor, step_floor
 __all__ = [
     "CHIPS",
     "ChipSpec",
+    "ConstantSpec",
+    "chip_catalog",
     "Collective",
     "ConcurrencyRow",
     "DEFAULT_GPU_MEMORY_UTILIZATION",

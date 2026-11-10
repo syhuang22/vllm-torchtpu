@@ -373,3 +373,109 @@ def test_ffn_only_hybrid_override_excluded_from_full_attn_count() -> None:
     assert ng.ffn_layer_counts() == (1, 1)
     assert ng.ffn_kinds == ("none", "dense", "none", "none", "none", "moe")
     assert _count_full_attn_layers(ng) == 1
+
+
+_EXPECTED_DCN_DEFAULT_BW: float = 12.5e9
+_EXPECTED_DCN_LOW_BW: float = 6.25e9
+_EXPECTED_DCN_HIGH_BW: float = 25.0e9
+_SYNTH_HBM_BYTES: int = 34_400_000_000
+_SYNTH_HBM_BW: float = 1.64e12
+_SYNTH_BF16_FLOPS: float = 0.918e15
+_SYNTH_FP8_FLOPS: float = 1.836e15
+_SYNTH_VMEM_BYTES: int = 134_217_728
+_SYNTH_LINK_BW: float = 50.0e9
+_SYNTH_D2D_BW: float = 300.0e9
+
+
+def test_dcn_per_chip_derives_from_host_bandwidth() -> None:
+    """Verify per-chip DCN bandwidth is derived from host Gbit/s and chip count."""
+    chip = CHIPS["tpu7x"]
+    assert chip.dcn_bw == pytest.approx(_EXPECTED_DCN_DEFAULT_BW)
+    low = chips.from_jax(
+        "tpu7x",
+        "tpu7x",
+        dcn_host_gbit_per_s=200.0,
+        chips_per_host=4,
+    )
+    high = chips.from_jax(
+        "tpu7x",
+        "tpu7x",
+        dcn_host_gbit_per_s=800.0,
+        chips_per_host=4,
+    )
+    assert low.dcn_bw == pytest.approx(_EXPECTED_DCN_LOW_BW)
+    assert high.dcn_bw == pytest.approx(_EXPECTED_DCN_HIGH_BW)
+
+
+def test_every_constant_has_kind_unit_scope_source() -> None:
+    """Verify every catalog constant carries value, unit, scope, kind, and source."""
+    cat = CHIPS["tpu7x"].catalog()
+    expected_kinds = {
+        "hbm_bytes": "fact",
+        "hbm_bw": "fact",
+        "bf16_flops": "fact",
+        "fp8_flops": "fact",
+        "vmem_bytes": "fact",
+        "cores_per_chip": "fact",
+        "ici_link_bw": "derived",
+        "d2d_bw": "derived",
+        "ici_bw": "derived",
+        "dcn_bw": "derived",
+        "ici_hop_latency_s": "assumed",
+        "pcie_bw": "assumed",
+        "mxu_m_tile": "assumed",
+        "dcn_host_gbit_per_s": "assumed",
+        "chips_per_host": "assumed",
+        "page_table_byte_budget": "assumed",
+        "rpa_page_size_tokens": "assumed",
+        "default_gpu_memory_utilization": "config",
+    }
+    for key, exp_kind in expected_kinds.items():
+        assert key in cat, f"missing catalog key {key}"
+        entry = cat[key]
+        assert entry["kind"] == exp_kind
+        assert entry["scope"] in {"core", "chip", "host", "link"}
+        assert type(entry["unit"]) is str and bool(entry["unit"].strip())
+        assert type(entry["source"]) is str and bool(entry["source"].strip())
+        assert "value" in entry
+        if exp_kind == "assumed":
+            assert entry["bracket"] is not None
+    assert cat["dcn_bw"]["value"] == pytest.approx(_EXPECTED_DCN_DEFAULT_BW)
+    assert list(cat["dcn_bw"]["bracket"]) == [
+        _EXPECTED_DCN_LOW_BW,
+        _EXPECTED_DCN_HIGH_BW,
+    ]
+
+
+def test_second_chip_entry_loads_without_code_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify fallback table entry loads via from_jax without code edits."""
+    monkeypatch.setitem(
+        chips._FALLBACK_TPU_SPECS,
+        "synth_chip",
+        (
+            _SYNTH_HBM_BYTES,
+            _SYNTH_HBM_BW,
+            _SYNTH_BF16_FLOPS,
+            _SYNTH_FP8_FLOPS,
+            _SYNTH_VMEM_BYTES,
+        ),
+    )
+    spec = chips.from_jax(
+        "synth_chip",
+        "synth_chip",
+        cores_per_chip=1,
+        ici_link_bw=_SYNTH_LINK_BW,
+        dcn_host_gbit_per_s=200.0,
+        chips_per_host=4,
+    )
+    assert spec.name == "synth_chip"
+    assert spec.hbm_bytes == _SYNTH_HBM_BYTES
+    assert spec.cores_per_chip == 1
+    assert spec.d2d_bw == pytest.approx(_SYNTH_D2D_BW)
+    assert spec.ici_bw == pytest.approx(_SYNTH_D2D_BW)
+    assert spec.dcn_bw == pytest.approx(_EXPECTED_DCN_LOW_BW)
+    cat = spec.catalog()
+    assert cat["hbm_bytes"]["value"] == _SYNTH_HBM_BYTES
+    assert cat["dcn_bw"]["value"] == pytest.approx(_EXPECTED_DCN_LOW_BW)
