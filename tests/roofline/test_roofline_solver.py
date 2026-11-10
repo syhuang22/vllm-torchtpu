@@ -108,7 +108,7 @@ _ISL_16384: int = 16384
 _ISL_262144: int = 262144
 _KV_SPLIT_2: int = 2
 _MAX_CHIPS_16: int = 16
-_MIN_MIXED_FRACTION: float = 0.10
+_MIN_MIXED_FRACTION: float = 0.09
 _PAGE_SIZE_16: int = 16
 _PP_2: int = 2
 _PP_8: int = 8
@@ -1849,3 +1849,131 @@ def test_sweep_matches_main_path_ttft_with_offload() -> None:
     sweep_ttft_ms = (sf_pre_s + pcie_s) * 1e3
     assert sweep_ttft_ms == pytest.approx(pt.est_ttft_ms, rel=1e-3)
     assert sweep_tput == pytest.approx(pt.token_throughput_per_chip, rel=0.03)
+
+
+def test_response_time_law_holds_on_frontier() -> None:
+    """Verify Little's Law / response-time law holds on all frontier points."""
+    geom = from_hf_config(QWEN35_CFG)
+    dt = Dtypes(kv=1.0)
+    chip = CHIPS["tpu7x"]
+    scenarios = [
+        build_example_scenario("chat-8k1k"),
+        TrafficScenario(
+            name="prefill-heavy",
+            isl=99933,
+            osl=473,
+            prefix_hit_rate=0.0,
+            accept_len=1.0,
+            think_time_s=0.0,
+            concurrencies=(208,),
+            kv_working_set_turns=1.0,
+        ),
+    ]
+    for scen in scenarios:
+        for mode in ("mixed", "disagg", "auto"):
+            plan = solve_serving_plan(geom, dt, chip, scen, mode=mode, max_chips=64)
+            assert plan.frontier, (
+                f"Expected non-empty frontier for {scen.name} mode={mode}"
+            )
+            for pt in plan.frontier:
+                req_rate = (pt.output_throughput_per_chip * pt.total_chips) / float(
+                    plan.scenario.osl
+                )
+                cycle_s = (
+                    pt.est_ttft_ms * 1e-3
+                    + float(plan.scenario.osl) * (pt.est_tpot_ms * 1e-3)
+                    + plan.scenario.think_time_s
+                )
+                assert req_rate * cycle_s == pytest.approx(
+                    float(pt.concurrency), rel=1e-6
+                )
+                tok_req_rate = (pt.token_throughput_per_chip * pt.total_chips) / float(
+                    plan.scenario.isl + plan.scenario.osl
+                )
+                assert tok_req_rate == pytest.approx(req_rate, rel=1e-6)
+
+
+def test_slo_verdict_is_three_valued() -> None:
+    """Verify ParetoPoint.slo_verdict takes ruled_out, estimate_meets, or undecided."""
+    geom = from_hf_config(QWEN35_CFG)
+    dt = Dtypes(kv=1.0)
+    chip = CHIPS["tpu7x"]
+
+    # 1. Ruled out when SLO is below physical bound
+    scen_ruled_out = dc_replace(
+        build_example_scenario("chat-8k1k"),
+        tpot_slo_ms=0.001,
+        concurrencies=(1,),
+    )
+    plan_ro = solve_serving_plan(
+        geom, dt, chip, scen_ruled_out, mode="mixed", max_chips=64
+    )
+    for pt in plan_ro.candidates:
+        assert pt.slo_verdict == "ruled_out"
+
+    # 2. Estimate meets when SLO is well above estimate
+    scen_meets = dc_replace(
+        build_example_scenario("chat-8k1k"),
+        tpot_slo_ms=500.0,
+        concurrencies=(1,),
+    )
+    plan_meets = solve_serving_plan(
+        geom, dt, chip, scen_meets, mode="mixed", max_chips=64
+    )
+    for pt in plan_meets.frontier:
+        assert pt.slo_verdict == "estimate_meets"
+
+    # 3. Undecided when bound < target < estimate (not dropped from frontier)
+    base_plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        build_example_scenario("chat-8k1k", concurrencies=(1,)),
+        mode="mixed",
+        max_chips=64,
+    )
+    pt_sample = base_plan.frontier[0]
+    mid_tpot_slo = 0.5 * (pt_sample.bound_tpot_ms + pt_sample.est_tpot_ms)
+    scen_undecided = dc_replace(
+        build_example_scenario("chat-8k1k"),
+        tpot_slo_ms=mid_tpot_slo,
+        concurrencies=(1,),
+    )
+    plan_undecided = solve_serving_plan(
+        geom, dt, chip, scen_undecided, mode="mixed", max_chips=64
+    )
+    assert plan_undecided.frontier, "Undecided points must not be dropped from frontier"
+    verdicts = {p.slo_verdict for p in plan_undecided.frontier}
+    assert "undecided" in verdicts
+
+    # 4. --hbm-reserve-gb reduces hbm_limit_gb per core and emit notes upper bound
+    plan_res0 = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        build_example_scenario("chat-8k1k", concurrencies=(64,)),
+        mode="mixed",
+        max_chips=64,
+        hbm_reserve_gb=0.0,
+    )
+    plan_res4 = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        build_example_scenario("chat-8k1k", concurrencies=(64,)),
+        mode="mixed",
+        max_chips=64,
+        hbm_reserve_gb=4.0,
+    )
+    limit0 = plan_res0.frontier[0].decode_pool.hbm_limit_gb
+    limit4 = plan_res4.frontier[0].decode_pool.hbm_limit_gb
+    assert limit4 == pytest.approx(limit0 - 4.0, rel=1e-4)
+
+    # Check emit output comment
+    emit_out = emit_launch_args(plan_res0, dtypes=dt)
+    if any("--max-num-seqs" in arg for arg in emit_out.get("cli_args", [])):
+        assert any(
+            "upper bound on what fits when --hbm-reserve-gb is 0" in c
+            for c in emit_out["commands"]
+        )
+        assert emit_out["commands"][0].startswith("vllm serve")

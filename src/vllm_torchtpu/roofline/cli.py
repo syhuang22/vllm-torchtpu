@@ -449,6 +449,15 @@ def _add_scenario_args(p: argparse.ArgumentParser) -> None:
         ),
     )
     p.add_argument(
+        "--hbm-reserve-gb",
+        type=float,
+        default=0.0,
+        help=(
+            "HBM reserved per core excluded from serving limits "
+            "(unit: GB, scope: core)."
+        ),
+    )
+    p.add_argument(
         "--concurrency",
         default=None,
         help=(
@@ -939,6 +948,7 @@ def main(argv: list[str] | None = None) -> int:
             max_chips=eff_max_chips,
             max_instances=args.max_instances,
             gpu_memory_utilization=eff_gmu,
+            hbm_reserve_gb=args.hbm_reserve_gb,
         )
         cmd_warnings: list[str] = []
         if serve_parsed.get("spec_method") and serve_parsed["spec_method"] != "mtp":

@@ -303,6 +303,8 @@ class ParetoPoint:
     binding: str
     slo_met: bool
     bound_tpot_ms: float = 0.0
+    bound_ttft_ms: float = 0.0
+    slo_verdict: Literal["ruled_out", "estimate_meets", "undecided"] = "estimate_meets"
     decode_floor: FloorTimes | None = None
     kv_cache_capacity_tokens: int | None = None
     effective_prefix_hit_rate: float | None = None
@@ -327,6 +329,7 @@ class ServingPlan:
     prefix_hit_crossover_rate: float | None = None
     spec_tokens: int = 0
     mtp_layers: int = 0
+    hbm_reserve_gb: float = 0.0
 
 
 def _count_layer_types(
@@ -1448,6 +1451,7 @@ class _SolveContext:
     n_chunks: int
     page_size: int
     c_max: int
+    hbm_reserve_gb: float = 0.0
     enumerated: int = 0
     hbm_fit: int = 0
 
@@ -1463,6 +1467,7 @@ class _PrefillOption:
     hbm_gb: float
     hbm_bd: HbmBreakdown
     pp_part: tuple[int, ...] | None = None
+    bound_ttft_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1581,6 +1586,7 @@ def _find_prefill_options(
                     hbm_gb=hbm_b / 1e9,
                     hbm_bd=hbm_bd,
                     pp_part=pp_part_opt,
+                    bound_ttft_ms=sf_p.hard_floor_s * 1e3,
                 )
         prefill_options.extend(best_by_class.values())
     return prefill_options, min_req_ttft_ms
@@ -1728,100 +1734,123 @@ def _evaluate_mixed_point(
         else 0.0
     )
     pre_ttft_s = sf_ttft_c.serial_estimate_s + pcie_read_s
+    ttft_service_s = pre_ttft_s
+    bound_ttft_ms = sf_ttft_c.hard_floor_s * 1e3
     eff_isl_c = max(1, math.ceil((1.0 - h_eff) * ctx.scenario.isl))
     n_chunks_c = max(1, math.ceil(eff_isl_c / max(1, ctx.scenario.prefill_chunk)))
     chunk_tok_c = min(eff_isl_c, ctx.scenario.prefill_chunk)
-    sf_dec = (
-        spec_cycle_floor(
-            ctx.geom,
-            ctx.chip,
-            par,
-            b_res,
-            ctx.ctx_mid,
-            ctx.spec_k,
-            ctx.dtypes,
-            topology=topo,
+
+    eff_al = ctx.eff_al
+    think = ctx.scenario.think_time_s
+    osl = float(ctx.scenario.osl)
+    dec_steps_per_req = max(1.0, osl / eff_al)
+    dp_val = max(1, par.dp)
+    max_decode_seqs = float(b_res * dp_val)
+
+    b_dec = max(1.0, min(float(min(c, int(max_decode_seqs))), float(c)))
+    for _ in range(3):
+        b_replica = max(1, min(b_res, math.ceil(b_dec / float(dp_val))))
+        sf_dec = (
+            spec_cycle_floor(
+                ctx.geom,
+                ctx.chip,
+                par,
+                b_replica,
+                ctx.ctx_mid,
+                ctx.spec_k,
+                ctx.dtypes,
+                topology=topo,
+            )
+            if ctx.spec_k > 0
+            else step_floor(
+                ctx.geom,
+                ctx.chip,
+                par,
+                StepShape(batch=b_replica, context=ctx.ctx_mid),
+                ctx.dtypes,
+                topology=topo,
+            )
         )
-        if ctx.spec_k > 0
-        else step_floor(
-            ctx.geom,
-            ctx.chip,
-            par,
-            StepShape(batch=b_res, context=ctx.ctx_mid),
-            ctx.dtypes,
-            topology=topo,
+        sf_ver_only = (
+            step_floor(
+                ctx.geom,
+                ctx.chip,
+                par,
+                StepShape(
+                    batch=b_replica,
+                    rows_per_seq=ctx.spec_k + 1,
+                    context=ctx.ctx_mid,
+                    state_writes=1,
+                ),
+                ctx.dtypes,
+                topology=topo,
+            )
+            if ctx.spec_k > 0
+            else sf_dec
         )
-    )
-    sf_ver_only = (
-        step_floor(
+        draft_serial_s = max(
+            0.0, sf_dec.serial_estimate_s - sf_ver_only.serial_estimate_s
+        )
+        sf_mix = step_floor(
             ctx.geom,
             ctx.chip,
             par,
             StepShape(
-                batch=b_res,
+                batch=b_replica,
                 rows_per_seq=ctx.spec_k + 1,
                 context=ctx.ctx_mid,
                 state_writes=1,
+                prefill_tokens=chunk_tok_c,
+                prefix_hit_rate=0.0,
             ),
             ctx.dtypes,
             topology=topo,
         )
-        if ctx.spec_k > 0
-        else sf_dec
-    )
-    draft_serial_s = max(0.0, sf_dec.serial_estimate_s - sf_ver_only.serial_estimate_s)
-    sf_mix = step_floor(
-        ctx.geom,
-        ctx.chip,
-        par,
-        StepShape(
-            batch=b_res,
-            rows_per_seq=ctx.spec_k + 1,
-            context=ctx.ctx_mid,
-            state_writes=1,
-            prefill_tokens=chunk_tok_c,
-            prefix_hit_rate=0.0,
-        ),
-        ctx.dtypes,
-        topology=topo,
-    )
-    mix_serial_s = sf_mix.serial_estimate_s + draft_serial_s
-    total_req_work_s = (
-        dec_steps_per_req * sf_dec.serial_estimate_s
-        + float(b_res * n_chunks_c) * mix_serial_s
-    )
-    res_cap = float(b_res * max(1, par.dp))
-    c_served = min(float(c), res_cap)
-    server_cap_rate = res_cap / max(1e-9, total_req_work_s)
-    w_srv_final = pre_ttft_s + dec_steps_per_req * sf_dec.serial_estimate_s
-    rate_req_s = (
-        min(
-            server_cap_rate,
-            float(c) / max(1e-9, w_srv_final + ctx.scenario.think_time_s),
+        mix_serial_s = sf_mix.serial_estimate_s + draft_serial_s
+        p_mix = min(
+            1.0,
+            float(b_replica * n_chunks_c)
+            / float(max(1.0, dec_steps_per_req + float(b_replica * n_chunks_c))),
         )
-        if ctx.scenario.think_time_s > 0.0
-        else c_served / max(1e-9, total_req_work_s)
+        est_step_s = (1.0 - p_mix) * sf_dec.serial_estimate_s + p_mix * mix_serial_s
+        tpot_s = est_step_s / eff_al
+        T_dec = osl * tpot_s
+        total_req_work_s = (
+            dec_steps_per_req * sf_dec.serial_estimate_s
+            + float(b_res * n_chunks_c) * mix_serial_s
+            + float(b_res) * pcie_read_s
+        )
+        res_cap = float(b_res * dp_val)
+        X_capacity = res_cap / max(1e-9, total_req_work_s)
+        X = min(X_capacity, float(c) / max(1e-9, ttft_service_s + T_dec + think))
+        b_dec = max(1.0, min(float(min(c, int(max_decode_seqs))), X * T_dec))
+
+    X = min(X_capacity, float(c) / max(1e-9, ttft_service_s + T_dec + think))
+    ttft_est_s = float(c) / max(1e-9, X) - T_dec - think
+    est_ttft_ms = ttft_est_s * 1e3
+    est_tpot_ms = tpot_s * 1e3
+    interactivity = 1000.0 / max(1e-9, est_tpot_ms)
+    out_tput = (X * osl) / float(topo.num_chips)
+    tot_tput = (X * float(ctx.scenario.isl + ctx.scenario.osl)) / float(topo.num_chips)
+
+    bound_tpot_ms = (sf_dec.hard_floor_s * 1e3) / eff_al
+    slo_ruled_out = (
+        ctx.scenario.ttft_slo_ms is not None
+        and bound_ttft_ms > ctx.scenario.ttft_slo_ms
+    ) or (
+        ctx.scenario.tpot_slo_ms is not None
+        and bound_tpot_ms > ctx.scenario.tpot_slo_ms
     )
-    p_mix = min(
-        1.0,
-        float(b_res * n_chunks_c)
-        / float(max(1.0, dec_steps_per_req + float(b_res * n_chunks_c))),
-    )
-    est_step_s = (1.0 - p_mix) * sf_dec.serial_estimate_s + p_mix * mix_serial_s
-    est_tpot_ms = est_step_s * 1e3 / ctx.eff_al
-    c_demand = min(float(c), float(b_local * max(1, par.dp)))
-    queue_wait_s = max(0.0, (c_demand / max(1e-9, res_cap)) - 1.0) * w_srv_final
-    est_ttft_ms = (pre_ttft_s + queue_wait_s) * 1e3 + (
-        sf_mix.serial_estimate_s * 1e3 if c > 1 else 0.0
-    )
-    interactivity = 1000.0 / max(1e-6, est_tpot_ms)
-    out_tput = rate_req_s * float(ctx.scenario.osl) / float(topo.num_chips)
-    tot_tput = (
-        rate_req_s * float(ctx.scenario.isl + ctx.scenario.osl) / float(topo.num_chips)
-    )
-    slo_ok = (
+    if slo_ruled_out:
+        verdict: Literal["ruled_out", "estimate_meets", "undecided"] = "ruled_out"
+    elif (
         ctx.scenario.ttft_slo_ms is None or est_ttft_ms <= ctx.scenario.ttft_slo_ms
-    ) and (ctx.scenario.tpot_slo_ms is None or est_tpot_ms <= ctx.scenario.tpot_slo_ms)
+    ) and (ctx.scenario.tpot_slo_ms is None or est_tpot_ms <= ctx.scenario.tpot_slo_ms):
+        verdict = "estimate_meets"
+    else:
+        verdict = "undecided"
+    slo_ok = verdict != "ruled_out"
+
     max_seqs_flag = b_res if b_res < b_local else ctx.scenario.max_num_seqs
     pool = PoolMeshPlan(
         role="mixed",
@@ -1869,7 +1898,9 @@ def _evaluate_mixed_point(
         decode_floor=_floor_times(sf_dec),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=h_eff,
-        bound_tpot_ms=(sf_dec.hard_floor_s * 1e3) / ctx.eff_al,
+        bound_tpot_ms=bound_tpot_ms,
+        bound_ttft_ms=bound_ttft_ms,
+        slo_verdict=verdict,
     )
 
 
@@ -2031,35 +2062,18 @@ def _compute_disagg_metrics(
     dec: _DisaggDecodeState,
     pref: _PrefillOption,
     rates_in: tuple[int, int, int, int],
-    batch_in: tuple[int, int, float, float, float],
-    sf_d: StepFloor,
-) -> tuple[float, float, float, float, float]:
+    batch_in: tuple[int, int, float, float, float, float],
+) -> tuple[float, float, float, float, float, StepFloor]:
     """Compute serving latencies and throughputs for disaggregated configuration."""
     c, x_p, y_d, total_chips = rates_in
-    b_res, b_local, ttft_eff_ms, rate_p_eff, h_eff = batch_in
+    b_res, b_local, ttft_eff_ms, rate_p_eff, h_eff, _bound_ttft_p_ms = batch_in
     dec_steps_per_req = max(1.0, ctx.scenario.osl / ctx.eff_al)
-    est_tpot_ms = sf_d.serial_estimate_s * 1e3 / ctx.eff_al
-    interactivity = 1000.0 / max(1e-6, est_tpot_ms)
-    res_cap_d = float(b_res * max(1, y_d * dec.par.dp))
-    c_served_d = min(float(c), res_cap_d)
-    rate_d_cap = c_served_d / (dec_steps_per_req * max(1e-9, sf_d.serial_estimate_s))
-    c_demand_d = min(float(c), float(b_local * max(1, y_d * dec.par.dp)))
-    queue_wait_d_ms = (
-        max(0.0, (c_demand_d / max(1e-9, res_cap_d)) - 1.0)
-        * (dec_steps_per_req * sf_d.serial_estimate_s)
-        * 1e3
-    )
-    uncached_d_tok = max(1, math.ceil((1.0 - h_eff) * ctx.scenario.isl))
-    kv_xfer_ms = (
-        _disagg_kv_xfer_s(
-            ctx.geom,
-            ctx.dtypes,
-            ctx.chip,
-            (pref.topo, dec.topo),
-            uncached_d_tok,
-        )
-        * 1e3
-    )
+    eff_al = ctx.eff_al
+    think = ctx.scenario.think_time_s
+    osl = float(ctx.scenario.osl)
+    idp_val = max(1, y_d * dec.par.dp)
+    max_decode_seqs = float(b_res * idp_val)
+
     _, h_hbm_d = _kv_capacity_and_hit_rate(
         ctx.geom,
         ctx.dtypes,
@@ -2082,22 +2096,60 @@ def _compute_disagg_metrics(
         if offload_read_d_b > 0.0 and pcie_d_bw > 0.0 and math.isfinite(pcie_d_bw)
         else 0.0
     )
-    est_ttft_d_ms = ttft_eff_ms + pcie_d_ms + kv_xfer_ms + queue_wait_d_ms
-    if ctx.scenario.think_time_s > 0.0:
-        client_rate = float(c) / max(
-            1e-9,
-            ttft_eff_ms * 1e-3
-            + dec_steps_per_req * sf_d.serial_estimate_s
-            + ctx.scenario.think_time_s,
+    uncached_d_tok = max(1, math.ceil((1.0 - h_eff) * ctx.scenario.isl))
+    kv_xfer_ms = (
+        _disagg_kv_xfer_s(
+            ctx.geom,
+            ctx.dtypes,
+            ctx.chip,
+            (pref.topo, dec.topo),
+            uncached_d_tok,
         )
-        coupled_rate = min(x_p * rate_p_eff, rate_d_cap, client_rate)
-    else:
-        coupled_rate = min(x_p * rate_p_eff, rate_d_cap)
-    out_tput = coupled_rate * float(ctx.scenario.osl) / float(total_chips)
-    tot_tput = (
-        coupled_rate * float(ctx.scenario.isl + ctx.scenario.osl) / float(total_chips)
+        * 1e3
     )
-    return est_ttft_d_ms, est_tpot_ms, interactivity, out_tput, tot_tput
+    ttft_service_s = (ttft_eff_ms + pcie_d_ms + kv_xfer_ms) * 1e-3
+
+    b_dec = max(1.0, min(float(min(c, int(max_decode_seqs))), float(c)))
+    for _ in range(3):
+        b_replica = max(1, min(b_res, math.ceil(b_dec / float(idp_val))))
+        sf_d = (
+            spec_cycle_floor(
+                ctx.geom,
+                ctx.chip,
+                dec.par,
+                b_replica,
+                ctx.ctx_mid,
+                ctx.spec_k,
+                ctx.dtypes,
+                topology=dec.topo,
+            )
+            if ctx.spec_k > 0
+            else step_floor(
+                ctx.geom,
+                ctx.chip,
+                dec.par,
+                StepShape(batch=b_replica, context=ctx.ctx_mid),
+                ctx.dtypes,
+                topology=dec.topo,
+            )
+        )
+        tpot_s = sf_d.serial_estimate_s / eff_al
+        T_dec = osl * tpot_s
+        rate_d_cap = float(b_res * idp_val) / (
+            dec_steps_per_req * max(1e-9, sf_d.serial_estimate_s)
+        )
+        X_capacity = min(float(x_p) * rate_p_eff, rate_d_cap)
+        X = min(X_capacity, float(c) / max(1e-9, ttft_service_s + T_dec + think))
+        b_dec = max(1.0, min(float(min(c, int(max_decode_seqs))), X * T_dec))
+
+    X = min(X_capacity, float(c) / max(1e-9, ttft_service_s + T_dec + think))
+    ttft_est_s = float(c) / max(1e-9, X) - T_dec - think
+    est_ttft_d_ms = ttft_est_s * 1e3
+    est_tpot_ms = tpot_s * 1e3
+    interactivity = 1000.0 / max(1e-9, est_tpot_ms)
+    out_tput = (X * osl) / float(total_chips)
+    tot_tput = (X * float(ctx.scenario.isl + ctx.scenario.osl)) / float(total_chips)
+    return est_ttft_d_ms, est_tpot_ms, interactivity, out_tput, tot_tput, sf_d
 
 
 def _evaluate_disagg_instance_pair(
@@ -2105,7 +2157,7 @@ def _evaluate_disagg_instance_pair(
     dec: _DisaggDecodeState,
     pref: _PrefillOption,
     target: tuple[int, int, int],
-    cache: dict[tuple[str, Parallel, float], tuple[float, float]],
+    cache: dict[tuple[str, Parallel, float], tuple[float, float, float]],
 ) -> ParetoPoint | None:
     """Evaluate one instance ratio pair (x_p, y_d) for disaggregated serving."""
     c, x_p, y_d = target
@@ -2217,46 +2269,42 @@ def _evaluate_disagg_instance_pair(
                 * 1e3
             )
             rate_p_eff = 1.0 / max(1e-9, sf_p_eff.serial_estimate_s)
-            cached_p = (ttft_p_eff, rate_p_eff)
+            cached_p = (ttft_p_eff, rate_p_eff, sf_p_eff.hard_floor_s * 1e3)
             cache[p_key] = cached_p
-        ttft_eff_ms, rate_p_eff = cached_p
+        ttft_eff_ms, rate_p_eff, bound_ttft_p_ms = cached_p
     else:
         ttft_eff_ms = pref.ttft_ms
         rate_p_eff = pref.rate_p
-    sf_d = (
-        spec_cycle_floor(
-            ctx.geom,
-            ctx.chip,
-            dec.par,
-            b_res,
-            ctx.ctx_mid,
-            ctx.spec_k,
-            ctx.dtypes,
-            topology=dec.topo,
-        )
-        if ctx.spec_k > 0
-        else step_floor(
-            ctx.geom,
-            ctx.chip,
-            dec.par,
-            StepShape(batch=b_res, context=ctx.ctx_mid),
-            ctx.dtypes,
-            topology=dec.topo,
-        )
-    )
-    est_ttft_d_ms, est_tpot_ms, interactivity, out_tput, tot_tput = (
+        bound_ttft_p_ms = pref.bound_ttft_ms
+    est_ttft_d_ms, est_tpot_ms, interactivity, out_tput, tot_tput, sf_d = (
         _compute_disagg_metrics(
             ctx,
             dec,
             pref,
             (c, x_p, y_d, total_chips),
-            (b_res, b_local, ttft_eff_ms, rate_p_eff, h_eff),
-            sf_d,
+            (b_res, b_local, ttft_eff_ms, rate_p_eff, h_eff, bound_ttft_p_ms),
         )
     )
-    slo_ok = (
+    bound_tpot_ms = (sf_d.hard_floor_s * 1e3) / ctx.eff_al
+    bound_ttft_ms = bound_ttft_p_ms
+
+    slo_ruled_out = (
+        ctx.scenario.ttft_slo_ms is not None
+        and bound_ttft_ms > ctx.scenario.ttft_slo_ms
+    ) or (
+        ctx.scenario.tpot_slo_ms is not None
+        and bound_tpot_ms > ctx.scenario.tpot_slo_ms
+    )
+    if slo_ruled_out:
+        verdict: Literal["ruled_out", "estimate_meets", "undecided"] = "ruled_out"
+    elif (
         ctx.scenario.ttft_slo_ms is None or est_ttft_d_ms <= ctx.scenario.ttft_slo_ms
-    ) and (ctx.scenario.tpot_slo_ms is None or est_tpot_ms <= ctx.scenario.tpot_slo_ms)
+    ) and (ctx.scenario.tpot_slo_ms is None or est_tpot_ms <= ctx.scenario.tpot_slo_ms):
+        verdict = "estimate_meets"
+    else:
+        verdict = "undecided"
+    slo_ok = verdict != "ruled_out"
+
     max_seqs_d = b_res if b_res < b_local else ctx.scenario.max_num_seqs
     p_pool = PoolMeshPlan(
         role="prefill",
@@ -2326,7 +2374,9 @@ def _evaluate_disagg_instance_pair(
         decode_floor=_floor_times(sf_d),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=h_eff,
-        bound_tpot_ms=(sf_d.hard_floor_s * 1e3) / ctx.eff_al,
+        bound_tpot_ms=bound_tpot_ms,
+        bound_ttft_ms=bound_ttft_ms,
+        slo_verdict=verdict,
     )
 
 
@@ -2335,7 +2385,7 @@ def _search_disagg_instance_ratios(
     dec: _DisaggDecodeState,
     pref: _PrefillOption,
     c: int,
-    cache: dict[tuple[str, Parallel, float], tuple[float, float]],
+    cache: dict[tuple[str, Parallel, float], tuple[float, float, float]],
 ) -> list[ParetoPoint]:
     """Search instance multiplier ratios (x_p, y_d) for one prefill-decode pair."""
     dec_steps_per_req = max(1.0, ctx.scenario.osl / ctx.eff_al)
@@ -2393,7 +2443,7 @@ def _evaluate_disaggregated_candidates(
     if ctx.mode not in ("auto", "disagg") or not prefill_options:
         return []
     candidates: list[ParetoPoint] = []
-    cache: dict[tuple[str, Parallel, float], tuple[float, float]] = {}
+    cache: dict[tuple[str, Parallel, float], tuple[float, float, float]] = {}
     for topo_d in topos:
         for par_d in _candidate_decode_parallels(ctx.geom, topo_d):
             offload_b = (
@@ -2448,6 +2498,7 @@ def solve_serving_plan(
     chip: ChipSpec,
     scenario: TrafficScenario,
     *args: object,
+    hbm_reserve_gb: float = 0.0,
     **kwargs: object,
 ) -> ServingPlan:
     """Search single-pool mixed and unconstrained xP/yD disagg plans."""
@@ -2468,11 +2519,17 @@ def solve_serving_plan(
         if isinstance(gpu_util_val, (int, float, str))
         else DEFAULT_GPU_MEMORY_UTILIZATION
     )
+    hbm_reserve_val = kwargs.get("hbm_reserve_gb", hbm_reserve_gb)
+    eff_hbm_reserve_gb = float(hbm_reserve_val) if hbm_reserve_val is not None else 0.0
 
     if not (0.0 < gpu_memory_utilization <= 1.0):
         msg = f"gpu_memory_utilization must be in (0, 1], got {gpu_memory_utilization}"
         raise ValueError(msg)
-    hbm_limit_b = float(gpu_memory_utilization) * float(chip.hbm_bytes)
+    hbm_limit_b = max(
+        0.0,
+        float(gpu_memory_utilization) * float(chip.hbm_bytes)
+        - eff_hbm_reserve_gb * 1e9,
+    )
     eff_al = max(1.0, scenario.accept_len)
     spec_k = (
         scenario.spec_tokens
@@ -2507,6 +2564,7 @@ def solve_serving_plan(
         n_chunks=n_chunks,
         page_size=page_size,
         c_max=max(scenario.concurrencies),
+        hbm_reserve_gb=eff_hbm_reserve_gb,
     )
 
     topos = [
@@ -2547,8 +2605,11 @@ def solve_serving_plan(
         warnings.append("SLO_UNMET: no feasible topology met both TTFT and TPOT bounds")
 
     frontier = _pareto_filter(pool_for_frontier)
+    rec_pool = [p for p in frontier if p.slo_verdict == "estimate_meets"]
+    if not rec_pool:
+        rec_pool = list(frontier)
     recommended = (
-        max(frontier, key=lambda p: p.token_throughput_per_chip) if frontier else None
+        max(rec_pool, key=lambda p: p.token_throughput_per_chip) if rec_pool else None
     )
     pruned_sweep = _prune_sweep_candidates(geom, dtypes, chip, scenario, candidates)
     base_plan = ServingPlan(
@@ -2570,6 +2631,7 @@ def solve_serving_plan(
         sweep_candidates=pruned_sweep,
         spec_tokens=spec_k,
         mtp_layers=geom.mtp_layers,
+        hbm_reserve_gb=eff_hbm_reserve_gb,
     )
     win_range, cross_rate = sweep_prefix_hit_crossovers(geom, dtypes, chip, base_plan)
     return replace(
@@ -3044,6 +3106,7 @@ class _GridEvalContext:
     has_think: bool
     ttft_slo: float | None
     tpot_slo: float | None
+    get_dec_sf: Callable[[int, int], tuple[float, float]]
 
 
 class _CandidateState:
@@ -3058,32 +3121,19 @@ class _CandidateState:
 
 
 def _calc_mix_ttft_and_rate(
-    d_pid: int,
-    d_pool: PoolMeshPlan,
-    h_and_pcie: tuple[float, float],
-    mix_state: tuple[
-        float, float, tuple[float, float, float, float, bool, float], _GridEvalContext
-    ],
+    conc_f: float,
+    X_capacity: float,
+    ttft_service_s: float,
+    t_dec_s: float,
+    think_s: float,
 ) -> tuple[float, float]:
     """Calculate mixed candidate TTFT and served throughput rate."""
-    h_eff, pcie_s = h_and_pcie
-    denom_w, over, mix_info, ctx = mix_state
-    dec_dur_s, sf_mix_s, res_cap, c_srv, has_c_gt1, conc_f = mix_info
-    if not ctx.need_ttft:
-        return (0.0, c_srv / denom_w)
-    sf_pre_s = ctx.pre_cache.get((d_pid, h_eff))
-    if sf_pre_s is None:
-        sf_pre_s = ctx.compute_pre_sf(d_pid, d_pool, h_eff)
-    pre_ttft_s = sf_pre_s + pcie_s
-    w_srv_final = pre_ttft_s + dec_dur_s
-    if ctx.has_think:
-        wt = w_srv_final + ctx.think_s
-        rate_s = min(res_cap / denom_w, conc_f / max(1e-09, wt))
-    else:
-        rate_s = c_srv / denom_w
-    ttft_h = (pre_ttft_s + over * w_srv_final) * 1e3 + (
-        sf_mix_s * 1e3 if has_c_gt1 else 0.0
+    rate_s = min(
+        X_capacity,
+        conc_f / max(1e-09, ttft_service_s + t_dec_s + think_s),
     )
+    ttft_s = conc_f / max(1e-09, rate_s) - t_dec_s - think_s
+    ttft_h = ttft_s * 1e3
     return (ttft_h, rate_s)
 
 
@@ -3105,18 +3155,18 @@ def _eval_grid_mix_candidates(
         d_pool,
         d_pid,
         b_res,
-        b_res_f,
+        _b_res_f,
         cap_ratio,
         hbm_ratio,
         pcie_slope,
-        sf_dec_s,
-        dec_dur_s,
-        draft_s,
+        _sf_dec_s,
+        _dec_dur_s,
+        _draft_s,
         res_cap,
-        c_srv,
+        _c_srv,
         conc_f,
-        has_c_gt1,
-        over,
+        _has_c_gt1,
+        _over,
         inv_chips,
         neg_chips,
     ) in mix_meta:
@@ -3134,27 +3184,42 @@ def _eval_grid_mix_candidates(
             if pcie_slope > 0.0
             else 0.0
         )
-        sf_mix_s = ctx.mix_cache.get((d_pid, b_res, chunk_tok_c))
-        if sf_mix_s is None:
-            sf_mix_s = ctx.compute_mix_sf(d_pid, b_res, chunk_tok_c)
-        mix_serial_s = sf_mix_s + draft_s
-        bn = b_res_f * float(n_chk)
-        tot_work_s = dec_dur_s + bn * mix_serial_s
-        denom_w = max(1e-09, tot_work_s)
+        sf_pre_s = ctx.pre_cache.get((d_pid, h_eff))
+        if sf_pre_s is None:
+            sf_pre_s = ctx.compute_pre_sf(d_pid, d_pool, h_eff)
+        pre_ttft_s = sf_pre_s + pcie_s
+        ttft_service_s = pre_ttft_s
+
+        d_dp = max(1, d_pool.dp)
+        max_seqs = float(b_res * d_dp)
+        b_dec = max(1.0, min(max_seqs, conc_f))
+        for _ in range(3):
+            b_rep = max(1, min(b_res, math.ceil(b_dec / float(d_dp))))
+            sf_dec_s_step, draft_s_step = ctx.get_dec_sf(d_pid, b_rep)
+            dec_dur_s_step = ctx.dec_steps * sf_dec_s_step
+            sf_mix_s = ctx.mix_cache.get((d_pid, b_rep, chunk_tok_c))
+            if sf_mix_s is None:
+                sf_mix_s = ctx.compute_mix_sf(d_pid, b_rep, chunk_tok_c)
+            mix_serial_s = sf_mix_s + draft_s_step
+            bn = float(b_rep * n_chk)
+            tot_work_s = (
+                dec_dur_s_step
+                + float(b_res * n_chk) * mix_serial_s
+                + float(b_res) * pcie_s
+            )
+            denom_pm = ctx.dec_steps + bn
+            p_mix = min(1.0, bn / max(1.0, denom_pm))
+            est_step_s = (1.0 - p_mix) * sf_dec_s_step + p_mix * mix_serial_s
+            t_dec_s = ctx.dec_steps * est_step_s
+            X_capacity = res_cap / max(1e-09, tot_work_s)
+            ttft_h, rate_s = _calc_mix_ttft_and_rate(
+                conc_f, X_capacity, ttft_service_s, t_dec_s, ctx.think_s
+            )
+            b_dec = max(1.0, min(max_seqs, rate_s * t_dec_s))
+
         ttft_h, rate_s = _calc_mix_ttft_and_rate(
-            d_pid,
-            d_pool,
-            (h_eff, pcie_s),
-            (
-                denom_w,
-                over,
-                (dec_dur_s, sf_mix_s, res_cap, c_srv, has_c_gt1, conc_f),
-                ctx,
-            ),
+            conc_f, X_capacity, ttft_service_s, t_dec_s, ctx.think_s
         )
-        denom_pm = ctx.dec_steps + bn
-        p_mix = min(1.0, bn / max(1.0, denom_pm))
-        est_step_s = (1.0 - p_mix) * sf_dec_s + p_mix * mix_serial_s
         tpot_h = est_step_s * ctx.inv_al_ms
         inter_h = 1000.0 / max(1e-06, tpot_h)
         tput = rate_s * float(scen.isl + scen.osl) * inv_chips
@@ -3226,7 +3291,6 @@ def _eval_grid_disagg_ttft(
         denom_pre = max(1e-09, sf_pre_s)
         bub = 1.0 + bub_num / float(n_chk) if bub_num > 0.0 else 1.0
         pre_bub_s = sf_pre_s * bub
-        pre_bub_ms = pre_bub_s * 1e3
         for (
             p_inst_f,
             rate_d,
@@ -3250,13 +3314,13 @@ def _eval_grid_disagg_ttft(
                 else 0.0
             )
             xfer_ms = wire_b_h * inv_min_c_dcn_ms
-            ttft_h = pre_bub_ms + pcie_s * 1e3 + xfer_ms + q_wait_d_ms
-            if ctx.has_think:
-                wt_d = pre_bub_s + pcie_s + xfer_ms * 1e-3 + dec_dur_s + ctx.think_s
-                c_rate_d = conc_f / max(1e-09, wt_d)
-                coupled = min(coupled_cap, c_rate_d)
-            else:
-                coupled = coupled_cap
+            ttft_service_s = pre_bub_s + pcie_s + xfer_ms * 1e-3
+            coupled = min(
+                coupled_cap,
+                conc_f / max(1e-09, ttft_service_s + dec_dur_s + ctx.think_s),
+            )
+            ttft_s = conc_f / max(1e-09, coupled) - dec_dur_s - ctx.think_s
+            ttft_h = ttft_s * 1e3
             tput = coupled * float(scen.isl + scen.osl) * inv_chips
             slo_ok = tpot_ok and (ctx.ttft_slo is None or ttft_h <= ctx.ttft_slo)
             if slo_ok:
@@ -3767,6 +3831,7 @@ def _setup_crossover_sweep(
         has_think=planner.has_think,
         ttft_slo=scen.ttft_slo_ms,
         tpot_slo=scen.tpot_slo_ms,
+        get_dec_sf=planner.get_dec_sf,
     )
     return ((mix_meta, dis_fast_groups, dis_ttft_groups), ctx)
 

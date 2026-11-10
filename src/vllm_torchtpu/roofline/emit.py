@@ -189,6 +189,7 @@ def point_launch_args(
     model: str | None = None,
     spec_tokens: int = 0,
     mtp_layers: int = 0,
+    hbm_reserve_gb: float = 0.0,
 ) -> dict[str, Any]:
     """Emit ``vllm serve`` CLI flags and commands for a single ParetoPoint."""
     decode_args = pool_cli_args(
@@ -228,6 +229,14 @@ def point_launch_args(
         ]
     else:
         commands = [decode_cmd]
+
+    if (
+        "--max-num-seqs" in decode_args or "--max-num-seqs" in prefill_args
+    ) and hbm_reserve_gb == 0.0:
+        commands.append(
+            "# Note: --max-num-seqs is an upper bound on what fits when "
+            "--hbm-reserve-gb is 0"
+        )
 
     return {
         "mode": pt.mode,
@@ -274,6 +283,7 @@ def emit_launch_args(
         model=model,
         spec_tokens=eff_spec,
         mtp_layers=plan_mtp,
+        hbm_reserve_gb=plan.hbm_reserve_gb,
     )
     return {
         **launch,
@@ -352,6 +362,7 @@ def build_solve_payload(
                 if plan.spec_tokens > 0
                 else (plan.scenario.spec_tokens or 0),
                 mtp_layers=plan.mtp_layers,
+                hbm_reserve_gb=plan.hbm_reserve_gb,
             ),
         }
         for idx, pt in enumerate(top_pts)
