@@ -121,6 +121,9 @@ if TYPE_CHECKING:
         fit_vmem_budget_bytes,
         validate_advise_inputs,
     )
+    from ..advisor.workbench_engine import (
+        render_workbench_engine_js,
+    )
 
 _SUBMODULES = frozenset(
     {
@@ -138,6 +141,7 @@ _SUBMODULES = frozenset(
         "support",
         "verdict",
         "vmem",
+        "workbench_engine",
     }
 )
 
@@ -232,6 +236,8 @@ _LAZY = {
     "compute_per_token_vmem_bytes": ".vmem",
     "fit_vmem_budget_bytes": ".vmem",
     "validate_advise_inputs": ".vmem",
+    # workbench_engine
+    "render_workbench_engine_js": ".workbench_engine",
 }
 
 
@@ -325,6 +331,7 @@ __all__ = [
     "recommend_parallelism",
     "render_advisor_html",
     "render_regime_dot_plot_svg",
+    "render_workbench_engine_js",
     "resolve_chip_spec",
     "resolve_hf_snapshot_config",
     "resolve_model_profile",
