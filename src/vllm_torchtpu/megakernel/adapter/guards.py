@@ -17,7 +17,6 @@ config, before `create`. Config and local device facts only: no collective."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
 from vllm_torchtpu import _OFFLOADING_CONNECTORS
@@ -51,7 +50,7 @@ def _ep_group_size() -> int:
             raise
         return 1
     group = get_ep_group()
-    return int(group.world_size) if group is not None else 1
+    return group.world_size if group is not None else 1
 
 
 def _dp_size(parallel_config: Any) -> int:
@@ -63,7 +62,7 @@ def _dp_size(parallel_config: Any) -> int:
         if not _without_vllm(exc):
             raise
         return 1
-    return int(get_dp_size(parallel_config))
+    return get_dp_size(parallel_config)
 
 
 def _runner_cfg(runner: Any, name: str) -> Any:
@@ -97,45 +96,6 @@ def _decline(code: str, detail: str) -> EligibilityResult:
     return EligibilityResult(False, code, f"Megakernel {detail}; skipping.")
 
 
-def _mm_limit_count(limit: Any) -> int:
-    """Item count of one `limit_mm_per_prompt` entry (an int, or vLLM's
-    per-modality options object / dict with a `count`)."""
-    if isinstance(limit, Mapping):
-        limit = limit.get("count", 1)
-    else:
-        limit = getattr(limit, "count", limit)
-    try:
-        return int(limit)
-    except (TypeError, ValueError):
-        return 1
-
-
-def _multimodal_inputs_possible(runner: Any) -> bool:
-    """Whether a request on this server can carry multimodal inputs.
-
-    `runner.supports_mm_inputs` alone over-reports: vLLM 0.32 turns on
-    `enable_mm_embeds` for every KV connector with a consumer role (CPU KV
-    offload uses `kv_role="kv_both"`), which makes a language-model-only
-    server look multimodal. Inputs can't occur when the model config is
-    language-model-only or every `limit_mm_per_prompt` entry is 0; the
-    per-step `inputs_embeds` check (`ProgramDriver._text_ctx`) stays as the
-    safety net either way.
-    """
-    if not bool(getattr(runner, "supports_mm_inputs", False)):
-        return False
-    vcfg = getattr(runner, "vllm_config", None)
-    m_cfg = getattr(vcfg, "model_config", None) or getattr(runner, "model_config", None)
-    mm_cfg = getattr(m_cfg, "multimodal_config", None)
-    if mm_cfg is None:
-        return True
-    if bool(getattr(mm_cfg, "language_model_only", False)):
-        return False
-    limits = getattr(mm_cfg, "limit_per_prompt", None)
-    if isinstance(limits, Mapping) and limits:
-        return any(_mm_limit_count(v) > 0 for v in limits.values())
-    return True
-
-
 _PARALLELISM_DETAIL = {
     "dp": "agrees across the TP group only: data_parallel_size > 1 is unsupported",
     "ep_wider_than_tp": (
@@ -156,7 +116,7 @@ def detect_parallelism(runner: Any, tp_size: int) -> list[str]:
     dp = _dp_size(p_cfg)
     ep = bool(getattr(p_cfg, "enable_expert_parallel", False))
     # Only expert parallelism runs MoE collectives over vLLM's EP group.
-    ep_wide = ep and _ep_group_size() > max(1, int(tp_size))
+    ep_wide = ep and _ep_group_size() > max(1, tp_size)
     dp_fn = getattr(runner, "_dp_lockstep_enabled", None)
     pp_multi = not (
         getattr(runner, "_pp_is_first", True) and getattr(runner, "_pp_is_last", True)
@@ -244,21 +204,21 @@ def check_runner_features(
 ) -> EligibilityResult | None:
     """The first framework feature that is on but not declared, as a named
     decline (`None` if all are covered). Config only: no collective."""
-    caps = frozenset(features)
     rules: list[tuple[bool, str, str]] = [
         (
-            _multimodal_inputs_possible(runner) and "multimodal" not in caps,
+            bool(getattr(runner, "supports_mm_inputs", False))
+            and "multimodal" not in features,
             "multimodal_inputs",
             "requires text-only input_ids (multimodal inputs)",
         ),
         (
-            getattr(runner, "lora_config", None) is not None and "lora" not in caps,
+            getattr(runner, "lora_config", None) is not None and "lora" not in features,
             "lora_enabled",
             "does not support LoRA adapters",
         ),
         (
             bool(_aux_hidden_layers(_runner_backbone(runner)))
-            and "aux_hidden_states" not in caps,
+            and "aux_hidden_states" not in features,
             "aux_hidden_states",
             "does not support aux_hidden_state_layers",
         ),
@@ -279,40 +239,41 @@ def check_runner_features(
     rules = [
         (
             int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0) > 0
-            and "spec_decode" not in caps,
+            and "spec_decode" not in features,
             "spec_decode_unsupported",
             "plugin does not declare speculative decoding",
         ),
         (
-            bool(getattr(runner, "uses_mrope", False)) and "mrope" not in caps,
+            bool(getattr(runner, "uses_mrope", False)) and "mrope" not in features,
             "mrope_unsupported",
             "plugin does not declare M-RoPE",
         ),
         (
             bool(getattr(c_cfg, "enable_prefix_caching", False))
-            and "prefix_caching" not in caps,
+            and "prefix_caching" not in features,
             "prefix_caching_unsupported",
             "plugin does not declare prefix caching",
         ),
         (
-            offload and "kv_offload" not in caps,
+            offload and "kv_offload" not in features,
             "kv_offload_unsupported",
             "plugin does not declare KV offloading",
         ),
         (
-            other_kv is not None and "kv_transfer" not in caps,
+            other_kv is not None and "kv_transfer" not in features,
             f"kv_connector_unsupported:{other_kv}",
             f"plugin does not declare KV transfer (connector {other_kv})",
         ),
         (
-            bool(getattr(par_cfg, "enable_eplb", False)) and "eplb_dynamic" not in caps,
+            bool(getattr(par_cfg, "enable_eplb", False))
+            and "eplb_dynamic" not in features,
             "eplb_dynamic_unsupported",
             "plugin does not declare dynamic EPLB",
         ),
         # vLLM's `ModelConfig.enable_sleep_mode`.
         (
             bool(getattr(m_cfg, "enable_sleep_mode", False))
-            and "sleep_mode" not in caps,
+            and "sleep_mode" not in features,
             "sleep_mode_unsupported",
             "plugin does not declare sleep mode",
         ),
